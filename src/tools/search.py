@@ -108,5 +108,8 @@ def search_knowledge_base(
         return results
 
     except Exception as exc:  # noqa: BLE001
-        mlflow.log_param("search_error", str(exc))
+        # No mlflow.log_param here: at serving time there is no active run, so
+        # logging a param would itself raise. The @mlflow.trace span captures
+        # the exception context; we degrade gracefully to an empty result set.
+        print(f"search_knowledge_base error: {exc}")
         return []

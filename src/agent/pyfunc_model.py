@@ -16,7 +16,6 @@ from typing import Any
 import mlflow
 import mlflow.pyfunc
 import pandas as pd
-import requests
 
 from src.agent.prompts import SYSTEM_PROMPT, TOOL_DEFINITIONS
 from src.tools.logger import log_agent_action
@@ -33,6 +32,11 @@ class AgentModel(mlflow.pyfunc.PythonModel):
     The model accepts a user message, enters a ReAct-style tool-use loop
     against the Databricks Foundation Model API, and continues until the
     LLM returns a final text answer (no more tool calls).
+
+    Auth note: the LLM call goes through ``mlflow.deployments`` and Vector
+    Search / SQL through the Databricks SDK. Both pick up M2M OAuth that
+    Model Serving injects from the ``resources`` declaration — so no
+    DATABRICKS_TOKEN secret is required at serving time.
     """
 
     def __init__(self) -> None:
@@ -40,13 +44,36 @@ class AgentModel(mlflow.pyfunc.PythonModel):
         self._teams_webhook: str = ""
         self._index_name: str = "main.tech_engineer.sessions_vs_index"
         self._log_table: str = "main.tech_engineer.agent_action_log"
+        self._warehouse_id: str = ""
+
+    def configure(
+        self,
+        endpoint: str | None = None,
+        index_name: str | None = None,
+        log_table: str | None = None,
+        warehouse_id: str | None = None,
+    ) -> "AgentModel":
+        """Set configuration explicitly before logging (used by the deploy notebook).
+
+        Returns self so the call can be chained into log_model / resources.
+        """
+        if endpoint:
+            self._endpoint = endpoint
+        if index_name:
+            self._index_name = index_name
+        if log_table:
+            self._log_table = log_table
+        if warehouse_id is not None:
+            self._warehouse_id = warehouse_id
+        return self
 
     def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
         """Load runtime configuration from artifact + env vars; crash on misconfiguration."""
         self._endpoint = os.environ.get("DATABRICKS_FM_ENDPOINT", self._endpoint)
-        self._teams_webhook = os.environ.get("TEAMS_WEBHOOK_URL", "")
+        self._teams_webhook = os.environ.get("TEAMS_WEBHOOK_URL", self._teams_webhook)
         self._index_name = os.environ.get("VS_INDEX_NAME", self._index_name)
         self._log_table = os.environ.get("LOG_TABLE_NAME", self._log_table)
+        self._warehouse_id = os.environ.get("SQL_WAREHOUSE_ID", self._warehouse_id)
 
         try:
             config_path = (context.artifacts or {}).get("agent_config")
@@ -56,6 +83,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                 self._endpoint = cfg.get("llm_endpoint", self._endpoint)
                 self._index_name = cfg.get("vs_index_name", self._index_name)
                 self._log_table = cfg.get("log_table_name", self._log_table)
+                self._warehouse_id = cfg.get("warehouse_id", self._warehouse_id)
         except Exception as exc:
             raise RuntimeError(
                 f"load_context: failed to read agent_config artifact: {exc}"
@@ -69,12 +97,16 @@ class AgentModel(mlflow.pyfunc.PythonModel):
         """Declare UC resource dependencies for M2M OAuth injection in Model Serving."""
         from mlflow.models.resources import (
             DatabricksServingEndpoint,
+            DatabricksSQLWarehouse,
             DatabricksVectorSearchIndex,
         )
-        return [
+        res: list = [
             DatabricksVectorSearchIndex(index_name=self._index_name),
             DatabricksServingEndpoint(endpoint_name=self._endpoint),
         ]
+        if self._warehouse_id:
+            res.append(DatabricksSQLWarehouse(warehouse_id=self._warehouse_id))
+        return res
 
     def predict(
         self,
@@ -112,9 +144,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
             *messages,
         ]
 
-        with mlflow.start_run(nested=True):
-            final_answer = self._run_tool_loop(conversation)
-
+        final_answer = self._run_tool_loop(conversation)
         return {"choices": [{"message": {"role": "assistant", "content": final_answer}}]}
 
     def _run_tool_loop(self, conversation: list[dict]) -> str:
@@ -185,25 +215,25 @@ class AgentModel(mlflow.pyfunc.PythonModel):
         return answer
 
     def _call_llm(self, messages: list[dict]) -> dict:
-        """POST to the Databricks Foundation Model API chat completions endpoint."""
-        token = os.environ.get("DATABRICKS_TOKEN", "")
-        host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
-        url = f"{host}/serving-endpoints/{self._endpoint}/invocations"
+        """Call the Databricks Foundation Model endpoint via the deployments client.
 
-        payload = {
-            "messages": messages,
-            "tools": TOOL_DEFINITIONS,
-            "tool_choice": "auto",
-            "max_tokens": 2048,
-            "temperature": 0.2,
-        }
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        return resp.json()
+        Using ``get_deploy_client("databricks")`` (rather than a raw token POST)
+        means auth is handled by the platform: notebook credentials during
+        development, and injected M2M OAuth at serving time.
+        """
+        from mlflow.deployments import get_deploy_client
+
+        client = get_deploy_client("databricks")
+        return client.predict(
+            endpoint=self._endpoint,
+            inputs={
+                "messages": messages,
+                "tools": TOOL_DEFINITIONS,
+                "tool_choice": "auto",
+                "max_tokens": 2048,
+                "temperature": 0.2,
+            },
+        )
 
     def _dispatch_tool(self, tool_call: dict) -> Any:
         """Route a tool_call object to the correct Python function."""
@@ -231,6 +261,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                 output_payload=args.get("output_payload", {}),
                 table_name=self._log_table,
                 status=args.get("status", "SUCCESS"),
+                warehouse_id=self._warehouse_id or None,
             )
 
         return f"ERROR: Unknown tool '{name}'."
