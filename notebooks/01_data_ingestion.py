@@ -2,26 +2,24 @@
 # MAGIC %md
 # MAGIC # 01 — Data Ingestion & Vector Search Index Build
 # MAGIC
-# MAGIC **Purpose:** Process past Tech Engineer session PDFs and Databricks AI documentation
-# MAGIC into a Unity Catalog Vector Search index.
+# MAGIC **Purpose:** Process past Tech Engineer session documents (PDF / Markdown / text)
+# MAGIC and Databricks AI docs into a Unity Catalog Vector Search index.
 # MAGIC
 # MAGIC **Run order:** Execute cells top-to-bottom on a single-node cluster.
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-vectorsearch pypdf mlflow tiktoken --quiet
+# MAGIC %pip install databricks-vectorsearch pypdf tiktoken --quiet
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
 import hashlib
-import os
 import random
 import re
 import time
 from pathlib import Path
 
-import mlflow
 import requests
 import tiktoken
 from pypdf import PdfReader
@@ -45,6 +43,7 @@ DELTA_TABLE = f"{CATALOG}.{SCHEMA}.session_chunks"
 CHUNK_TOKENS = 512
 OVERLAP_TOKENS = 64
 CHUNK_VERSION = "v1"
+SUPPORTED_EXTS = {".pdf", ".md", ".markdown", ".txt"}
 
 CHUNKS_SCHEMA = StructType([
     StructField("chunk_id", StringType(), False),
@@ -64,22 +63,27 @@ DATABRICKS_TOKEN = (
 # COMMAND ----------
 
 # MAGIC %md ## Step 1 — Create Unity Catalog schema and volume (idempotent)
+# MAGIC
+# MAGIC The catalog (`main`) is assumed to already exist. We do not run
+# MAGIC `CREATE CATALOG` because workspaces without a metastore default storage
+# MAGIC root reject it (INVALID_STATE: "Metastore storage root URL does not exist").
+# MAGIC If you need a new catalog, create it once in the UI or with an explicit
+# MAGIC `MANAGED LOCATION`.
 
 # COMMAND ----------
 
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 spark.sql(
     f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.session_documents"
-    " COMMENT 'Raw PDF uploads for Tech Engineer sessions'"
+    " COMMENT 'Raw session document uploads (PDF / Markdown / text)'"
 )
 
 print(f"Schema ready: {CATALOG}.{SCHEMA}")
-print(f"Upload PDFs to: {SOURCE_VOLUME}")
+print(f"Upload documents to: {SOURCE_VOLUME}")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 2 — Parse PDFs and write chunks to Delta
+# MAGIC %md ## Step 2 — Parse documents (PDF / Markdown / text) and write chunks to Delta
 
 # COMMAND ----------
 
@@ -91,24 +95,28 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def extract_chunks_from_pdf(
-    pdf_path: str,
-    chunk_tokens: int = CHUNK_TOKENS,
-    overlap_tokens: int = OVERLAP_TOKENS,
-) -> list[dict]:
-    """Split a PDF into token-aware overlapping chunks with deterministic IDs."""
-    reader = PdfReader(pdf_path)
+def _read_pdf(path: str) -> str:
+    """Extract and normalise text from every page of a PDF."""
+    reader = PdfReader(path)
     raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    full_text = normalize_text(raw_text)
+    return normalize_text(raw_text)
 
+
+def _read_text_file(path: str) -> str:
+    """Read and normalise a Markdown or plain-text file (UTF-8, lenient)."""
+    raw_text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    return normalize_text(raw_text)
+
+
+def _chunk_text(full_text: str, source_file: str) -> list[dict]:
+    """Split normalised text into token-aware overlapping chunks with stable IDs."""
     enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(full_text)
-    stride = chunk_tokens - overlap_tokens
-    source_file = Path(pdf_path).name
+    stride = CHUNK_TOKENS - OVERLAP_TOKENS
 
     chunks = []
     for chunk_index, start in enumerate(range(0, len(tokens), stride)):
-        window = tokens[start : start + chunk_tokens]
+        window = tokens[start : start + CHUNK_TOKENS]
         if not window:
             break
         chunk_text = enc.decode(window)
@@ -129,14 +137,36 @@ def extract_chunks_from_pdf(
     return chunks
 
 
-all_chunks: list[dict] = []
-pdf_files = list(Path(SOURCE_VOLUME).glob("*.pdf"))
-print(f"Found {len(pdf_files)} PDF(s) in {SOURCE_VOLUME}")
+def extract_chunks_from_file(path: str) -> list[dict]:
+    """Read any supported document type and return its chunk records."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".pdf":
+        full_text = _read_pdf(path)
+    elif suffix in (".md", ".markdown", ".txt"):
+        full_text = _read_text_file(path)
+    else:
+        return []
 
-for pdf_path in pdf_files:
-    chunks = extract_chunks_from_pdf(str(pdf_path))
+    if not full_text.strip():
+        return []
+    return _chunk_text(full_text, Path(path).name)
+
+
+all_chunks: list[dict] = []
+source_files = sorted(
+    p for p in Path(SOURCE_VOLUME).glob("*") if p.suffix.lower() in SUPPORTED_EXTS
+)
+print(f"Found {len(source_files)} supported document(s) in {SOURCE_VOLUME}")
+
+for doc_path in source_files:
+    chunks = extract_chunks_from_file(str(doc_path))
     all_chunks.extend(chunks)
-    print(f"  {pdf_path.name}: {len(chunks)} chunks")
+    print(f"  {doc_path.name}: {len(chunks)} chunks")
+
+if not all_chunks:
+    raise ValueError(
+        f"No chunks produced. Upload .pdf/.md/.txt files to {SOURCE_VOLUME} and re-run."
+    )
 
 chunks_df = spark.createDataFrame(all_chunks, schema=CHUNKS_SCHEMA)
 
