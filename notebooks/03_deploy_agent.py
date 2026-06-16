@@ -2,10 +2,11 @@
 # MAGIC %md
 # MAGIC # 03 — Register Agent to Unity Catalog & Deploy to Model Serving
 # MAGIC
-# MAGIC **Purpose:** Log the AgentModel to Unity Catalog via MLflow, then deploy it
-# MAGIC to a Databricks Model Serving endpoint.
+# MAGIC **Purpose:** Smoke-test the agent locally, log it to Unity Catalog via MLflow,
+# MAGIC then deploy to a Databricks Model Serving endpoint.
 # MAGIC
 # MAGIC **Prerequisites:** Notebooks 01 and 02 must have been run successfully.
+# MAGIC **Cell order:** pre-registration smoke tests → log_model → alias → deploy → wait → live test
 
 # COMMAND ----------
 
@@ -14,8 +15,11 @@
 
 # COMMAND ----------
 
-import sys
+import json
 import os
+import sys
+import time
+
 import mlflow
 import mlflow.pyfunc
 
@@ -30,16 +34,92 @@ MODEL_NAME = f"{CATALOG}.{SCHEMA}.tech_engineer_agent"
 SERVING_ENDPOINT_NAME = "tech-engineer-agent-endpoint"
 EXPERIMENT_PATH = "/Users/digvijay@arsaga.jp/agent-deployment"
 
+LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
+VS_INDEX_NAME = "main.tech_engineer.sessions_vs_index"
+LOG_TABLE_NAME = "main.tech_engineer.agent_action_log"
+
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(EXPERIMENT_PATH)
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 1 — Log model to Unity Catalog
+# MAGIC %md ## Step 1 — Pre-registration smoke tests (must all pass before log_model)
 
 # COMMAND ----------
 
 from src.agent.pyfunc_model import AgentModel
+
+
+class _MockContext:
+    artifacts = {}
+
+
+SMOKE_TESTS = [
+    {
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Databricks Unity Catalogについて教えてください。",
+                }
+            ]
+        },
+        "expected_signal": "Unity Catalog",
+        "description": "Standard knowledge query",
+    },
+    {
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "過去のセッションでデータガバナンスについて話しましたか？",
+                }
+            ]
+        },
+        "expected_signal": "Source",
+        "description": "Citation required for retrieval-based answer",
+    },
+    {
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Pythonのクイックソートを実装してください。",
+                }
+            ]
+        },
+        "expected_signal": "対応できません",
+        "description": "Out-of-scope refusal",
+    },
+]
+
+agent_instance = AgentModel()
+agent_instance.load_context(_MockContext())
+
+failures = []
+for i, test in enumerate(SMOKE_TESTS):
+    try:
+        result = agent_instance.predict(_MockContext(), test["input"])
+        content = result["choices"][0]["message"]["content"]
+        if test["expected_signal"] not in content:
+            failures.append(
+                f"Test {i + 1} ({test['description']}): "
+                f"Expected '{test['expected_signal']}' in response.\n"
+                f"Got: {content[:300]}"
+            )
+        else:
+            print(f"PASS — Test {i + 1}: {test['description']}")
+    except Exception as exc:
+        failures.append(f"Test {i + 1} ({test['description']}): Exception: {exc}")
+
+assert not failures, "Pre-registration smoke tests failed:\n" + "\n\n".join(failures)
+print("\nAll smoke tests passed. Proceeding with model registration.")
+
+# COMMAND ----------
+
+# MAGIC %md ## Step 2 — Log model to Unity Catalog
+
+# COMMAND ----------
 
 pip_requirements = [
     "mlflow",
@@ -48,20 +128,55 @@ pip_requirements = [
     "pyspark",
 ]
 
+agent_config = {
+    "llm_endpoint": LLM_ENDPOINT,
+    "vs_index_name": VS_INDEX_NAME,
+    "log_table_name": LOG_TABLE_NAME,
+}
+
+from mlflow.models.signature import ModelSignature
+from mlflow.types.schema import ColSpec, Schema
+
+signature = ModelSignature(
+    inputs=Schema([ColSpec("string", "messages")]),
+    outputs=Schema([ColSpec("string", "choices")]),
+)
+
+input_example = {
+    "messages": [
+        {
+            "role": "user",
+            "content": "来週のTech Engineer共有会のアジェンダを作成してください。",
+        }
+    ]
+}
+
 with mlflow.start_run(run_name="agent-registration") as run:
+    tmp_config_path = f"/tmp/agent_config_{run.info.run_id}.json"
+    with open(tmp_config_path, "w") as f:
+        json.dump(agent_config, f)
+    mlflow.log_artifact(tmp_config_path, artifact_path="config")
+    os.unlink(tmp_config_path)
+
     model_info = mlflow.pyfunc.log_model(
         artifact_path="agent_model",
-        python_model=AgentModel(),
+        python_model=agent_instance,
         pip_requirements=pip_requirements,
         registered_model_name=MODEL_NAME,
         await_registration_for=300,
+        artifacts={
+            "agent_config": f"runs:/{run.info.run_id}/config/agent_config_{run.info.run_id}.json"
+        },
+        resources=agent_instance.resources,
+        signature=signature,
+        input_example=input_example,
     )
     print(f"Model logged. Run ID: {run.info.run_id}")
     print(f"Model URI: {model_info.model_uri}")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 2 — Set the registered model as Champion alias
+# MAGIC %md ## Step 3 — Set the registered model as Champion alias
 
 # COMMAND ----------
 
@@ -79,7 +194,7 @@ print(f"Set alias 'champion' -> version {latest_version} of {MODEL_NAME}")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 3 — Create or update the Model Serving endpoint
+# MAGIC %md ## Step 4 — Create or update the Model Serving endpoint
 
 # COMMAND ----------
 
@@ -98,11 +213,9 @@ served_model = ServedModelInput(
     workload_size=ServedModelInputWorkloadSize.SMALL,
     scale_to_zero_enabled=True,
     environment_vars={
-        "DATABRICKS_HOST": "{{secrets/agent_secrets/databricks_host}}",
-        "DATABRICKS_TOKEN": "{{secrets/agent_secrets/databricks_token}}",
         "TEAMS_WEBHOOK_URL": "{{secrets/agent_secrets/teams_webhook_url}}",
-        "VS_INDEX_NAME": "main.tech_engineer.sessions_vs_index",
-        "LOG_TABLE_NAME": "main.tech_engineer.agent_action_log",
+        "VS_INDEX_NAME": VS_INDEX_NAME,
+        "LOG_TABLE_NAME": LOG_TABLE_NAME,
     },
 )
 
@@ -123,12 +236,37 @@ else:
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 4 — Smoke test the live endpoint
+# MAGIC %md ## Step 5 — Wait for endpoint readiness before live test
+
+# COMMAND ----------
+
+
+def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int = 900) -> None:
+    """Poll until the endpoint reports ready=READY or raises TimeoutError."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        ep = wc.serving_endpoints.get(name=endpoint_name)
+        state = ep.state.config_update.value if ep.state else "UNKNOWN"
+        ready = ep.state.ready.value if ep.state else "NOT_READY"
+        print(f"  config_update={state} | ready={ready}")
+        if ready == "READY":
+            print(f"Endpoint {endpoint_name} is ready.")
+            return
+        time.sleep(30)
+    raise TimeoutError(
+        f"Endpoint {endpoint_name} did not become ready within {timeout_s}s"
+    )
+
+
+_wait_for_endpoint(w, SERVING_ENDPOINT_NAME)
+
+# COMMAND ----------
+
+# MAGIC %md ## Step 6 — Live endpoint smoke test
 
 # COMMAND ----------
 
 import requests
-import json
 
 token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 host = spark.conf.get("spark.databricks.workspaceUrl")
