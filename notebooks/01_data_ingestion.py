@@ -5,22 +5,28 @@
 # MAGIC **Purpose:** Process past Tech Engineer session PDFs and Databricks AI documentation
 # MAGIC into a Unity Catalog Vector Search index.
 # MAGIC
-# MAGIC **Run order:** Execute cells top-to-bottom on a single-node cluster with
-# MAGIC `databricks-vectorsearch` and `pypdf` installed.
+# MAGIC **Run order:** Execute cells top-to-bottom on a single-node cluster.
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-vectorsearch pypdf mlflow --quiet
+# MAGIC %pip install databricks-vectorsearch pypdf mlflow tiktoken --quiet
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
+import hashlib
 import os
+import random
+import re
+import time
 from pathlib import Path
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, monotonically_increasing_id
 import mlflow
+import requests
+import tiktoken
+from pypdf import PdfReader
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
 
 spark = SparkSession.builder.getOrCreate()
 
@@ -34,6 +40,15 @@ EMBEDDING_ENDPOINT = "databricks-gte-large-en"
 VS_ENDPOINT_NAME = "tech_engineer_vs_endpoint"
 VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.sessions_vs_index"
 DELTA_TABLE = f"{CATALOG}.{SCHEMA}.session_chunks"
+
+CHUNK_TOKENS = 512
+OVERLAP_TOKENS = 64
+CHUNK_VERSION = "v1"
+
+DATABRICKS_HOST = spark.conf.get("spark.databricks.workspaceUrl")
+DATABRICKS_TOKEN = (
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+)
 
 # COMMAND ----------
 
@@ -57,24 +72,47 @@ print(f"Upload PDFs to: {SOURCE_VOLUME}")
 
 # COMMAND ----------
 
-from pypdf import PdfReader
-import re
+
+def normalize_text(text: str) -> str:
+    """Strip ANSI escape codes and non-printable control characters."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return text
 
 
-def extract_chunks_from_pdf(pdf_path: str, chunk_size: int = 500) -> list[dict]:
-    """Split a PDF into fixed-size text chunks with metadata."""
+def extract_chunks_from_pdf(
+    pdf_path: str,
+    chunk_tokens: int = CHUNK_TOKENS,
+    overlap_tokens: int = OVERLAP_TOKENS,
+) -> list[dict]:
+    """Split a PDF into token-aware overlapping chunks with deterministic IDs."""
     reader = PdfReader(pdf_path)
-    full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    words = full_text.split()
+    raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    full_text = normalize_text(raw_text)
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(full_text)
+    stride = chunk_tokens - overlap_tokens
+    source_file = Path(pdf_path).name
+
     chunks = []
-    for i in range(0, len(words), chunk_size):
-        chunk_text = " ".join(words[i : i + chunk_size])
+    for chunk_index, start in enumerate(range(0, len(tokens), stride)):
+        window = tokens[start : start + chunk_tokens]
+        if not window:
+            break
+        chunk_text = enc.decode(window)
+        chunk_id = hashlib.sha256(
+            f"{source_file}|{chunk_index}|{chunk_text[:120]}|{CHUNK_VERSION}".encode()
+        ).hexdigest()
         chunks.append(
             {
+                "chunk_id": chunk_id,
                 "chunk_text": chunk_text,
-                "source_file": Path(pdf_path).name,
+                "source_file": source_file,
+                "chunk_index": chunk_index,
                 "session_date": None,
                 "topic_tags": None,
+                "version": CHUNK_VERSION,
             }
         )
     return chunks
@@ -89,28 +127,61 @@ for pdf_path in pdf_files:
     all_chunks.extend(chunks)
     print(f"  {pdf_path.name}: {len(chunks)} chunks")
 
-chunks_df = spark.createDataFrame(all_chunks).withColumn(
-    "chunk_id", monotonically_increasing_id().cast("string")
+chunks_df = spark.createDataFrame(all_chunks)
+
+# COMMAND ----------
+
+# MAGIC %md ### Pre-write data quality checks
+
+# COMMAND ----------
+
+null_count = chunks_df.filter(
+    col("chunk_id").isNull() | col("chunk_text").isNull()
+).count()
+assert null_count == 0, f"Data quality failure: {null_count} rows with null PK or chunk_text"
+
+dup_count = (
+    chunks_df.groupBy("chunk_id").count().filter(col("count") > 1).count()
 )
-chunks_df.write.format("delta").mode("overwrite").option(
-    "overwriteSchema", "true"
-).saveAsTable(DELTA_TABLE)
+assert dup_count == 0, f"Data quality failure: {dup_count} duplicate chunk_ids in this batch"
 
-print(f"\nWrote {chunks_df.count()} total chunks to {DELTA_TABLE}")
+print(f"Quality checks passed. {chunks_df.count()} chunks ready to merge.")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 3 — Enable Change Data Feed (required for Vector Search sync)
+# MAGIC %md ### Create Delta table (idempotent) and MERGE chunks
 
 # COMMAND ----------
 
-spark.sql(
-    f"ALTER TABLE {DELTA_TABLE} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)"
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {DELTA_TABLE} (
+  chunk_id     STRING NOT NULL,
+  chunk_text   STRING,
+  source_file  STRING,
+  chunk_index  INT,
+  session_date STRING,
+  topic_tags   STRING,
+  version      STRING
 )
+USING DELTA
+TBLPROPERTIES (delta.enableChangeDataFeed = true)
+""")
+
+chunks_df.createOrReplaceTempView("new_chunks_staging")
+
+spark.sql(f"""
+MERGE INTO {DELTA_TABLE} AS target
+USING new_chunks_staging AS source
+ON target.chunk_id = source.chunk_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+""")
+
+print(f"MERGE complete. Table: {DELTA_TABLE}")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 4 — Create Vector Search endpoint and index
+# MAGIC %md ## Step 3 — Create Vector Search endpoint and index
 
 # COMMAND ----------
 
@@ -118,7 +189,6 @@ from databricks.vector_search.client import VectorSearchClient
 
 vs_client = VectorSearchClient(disable_notice=True)
 
-# Create endpoint if it doesn't exist
 existing_endpoints = [e["name"] for e in vs_client.list_endpoints().get("endpoints", [])]
 if VS_ENDPOINT_NAME not in existing_endpoints:
     vs_client.create_endpoint(name=VS_ENDPOINT_NAME, endpoint_type="STANDARD")
@@ -128,7 +198,6 @@ else:
 
 # COMMAND ----------
 
-# Create Delta Sync index (auto-syncs when the Delta table is updated)
 try:
     vs_client.create_delta_sync_index(
         endpoint_name=VS_ENDPOINT_NAME,
@@ -148,11 +217,57 @@ except Exception as exc:
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 5 — Trigger initial sync and verify
+# MAGIC %md ## Step 4 — Trigger sync and poll until online
 
 # COMMAND ----------
 
-index = vs_client.get_index(index_name=VS_INDEX_NAME)
-index.sync()
-print("Sync triggered. Check status with: index.describe()")
-print(index.describe())
+
+def _retryable_call(fn, retries: int = 8, base_sleep: float = 1.5, max_sleep: float = 20.0):
+    """Call fn with exponential backoff + jitter. Raises on final failure."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == retries - 1:
+                raise
+            sleep_time = min(base_sleep * (2 ** attempt) + random.uniform(0, 1), max_sleep)
+            print(f"Attempt {attempt + 1} failed ({exc}). Retrying in {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
+
+
+def _trigger_vs_sync(host: str, token: str, index_name: str) -> dict:
+    """POST directly to the VS sync REST endpoint (bypasses SDK hang issue)."""
+    url = f"https://{host}/api/2.0/vector-search/indexes/{index_name.replace('.', '/')}/sync"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _poll_vs_status(host: str, token: str, index_name: str, timeout_s: int = 600) -> None:
+    """Poll VS index status until ONLINE or timeout. Handles both API response shapes."""
+    url = f"https://{host}/api/2.0/vector-search/indexes/{index_name.replace('.', '/')}"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        resp = requests.get(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=30
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        status = (
+            body.get("status", {}).get("detailed_state")
+            or body.get("result", {}).get("status", "UNKNOWN")
+        )
+        print(f"VS index status: {status}")
+        if "ONLINE" in str(status).upper():
+            print(f"VS index is online: {VS_INDEX_NAME}")
+            return
+        time.sleep(15)
+    raise TimeoutError(f"VS index did not come online within {timeout_s}s")
+
+
+_retryable_call(lambda: _trigger_vs_sync(DATABRICKS_HOST, DATABRICKS_TOKEN, VS_INDEX_NAME))
+_poll_vs_status(DATABRICKS_HOST, DATABRICKS_TOKEN, VS_INDEX_NAME)
