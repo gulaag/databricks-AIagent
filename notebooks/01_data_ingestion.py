@@ -27,6 +27,7 @@ import tiktoken
 from pypdf import PdfReader
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
+from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
 spark = SparkSession.builder.getOrCreate()
 
@@ -44,6 +45,16 @@ DELTA_TABLE = f"{CATALOG}.{SCHEMA}.session_chunks"
 CHUNK_TOKENS = 512
 OVERLAP_TOKENS = 64
 CHUNK_VERSION = "v1"
+
+CHUNKS_SCHEMA = StructType([
+    StructField("chunk_id", StringType(), False),
+    StructField("chunk_text", StringType(), True),
+    StructField("source_file", StringType(), True),
+    StructField("chunk_index", IntegerType(), True),
+    StructField("session_date", StringType(), True),
+    StructField("topic_tags", StringType(), True),
+    StructField("version", StringType(), True),
+])
 
 DATABRICKS_HOST = spark.conf.get("spark.databricks.workspaceUrl")
 DATABRICKS_TOKEN = (
@@ -127,7 +138,7 @@ for pdf_path in pdf_files:
     all_chunks.extend(chunks)
     print(f"  {pdf_path.name}: {len(chunks)} chunks")
 
-chunks_df = spark.createDataFrame(all_chunks)
+chunks_df = spark.createDataFrame(all_chunks, schema=CHUNKS_SCHEMA)
 
 # COMMAND ----------
 
