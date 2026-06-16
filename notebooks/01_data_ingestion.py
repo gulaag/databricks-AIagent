@@ -277,8 +277,12 @@ def _retryable_call(fn, retries: int = 8, base_sleep: float = 1.5, max_sleep: fl
 
 
 def _trigger_vs_sync(host: str, token: str, index_name: str) -> dict:
-    """POST directly to the VS sync REST endpoint (bypasses SDK hang issue)."""
-    url = f"https://{host}/api/2.0/vector-search/indexes/{index_name.replace('.', '/')}/sync"
+    """POST directly to the VS sync REST endpoint (bypasses SDK hang issue).
+
+    The index name is the full dotted UC name and is a single path segment;
+    it must NOT be split into slash-separated segments.
+    """
+    url = f"https://{host}/api/2.0/vector-search/indexes/{index_name}/sync"
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {token}"},
@@ -290,7 +294,7 @@ def _trigger_vs_sync(host: str, token: str, index_name: str) -> dict:
 
 def _poll_vs_status(host: str, token: str, index_name: str, timeout_s: int = 600) -> None:
     """Poll VS index status until ONLINE or timeout. Handles both API response shapes."""
-    url = f"https://{host}/api/2.0/vector-search/indexes/{index_name.replace('.', '/')}"
+    url = f"https://{host}/api/2.0/vector-search/indexes/{index_name}"
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         resp = requests.get(
