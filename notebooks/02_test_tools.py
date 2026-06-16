@@ -24,6 +24,10 @@ sys.path.insert(0, "/Workspace/Users/digvijay@arsaga.jp/databricks-AIagent")
 VS_INDEX_NAME = "main.tech_engineer.sessions_vs_index"
 LOG_TABLE_NAME = "main.tech_engineer.agent_action_log"
 
+# Leave empty to log via Spark (works in any notebook). Set to a SQL warehouse
+# ID to exercise the same statement-execution path used at serving time.
+SQL_WAREHOUSE_ID = ""
+
 # Teams webhook URL — retrieve from UC secrets at runtime:
 # TEAMS_WEBHOOK_URL = dbutils.secrets.get(scope="agent_secrets", key="teams_webhook_url")
 TEAMS_WEBHOOK_URL = ""  # Replace with your test webhook URL
@@ -97,6 +101,7 @@ with mlflow.start_run(run_name="test_logger"):
         output_payload={"status": "verified"},
         table_name=LOG_TABLE_NAME,
         status="SUCCESS",
+        warehouse_id=SQL_WAREHOUSE_ID or None,
     )
     print(result)
 
