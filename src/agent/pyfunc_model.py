@@ -75,19 +75,22 @@ class AgentModel(mlflow.pyfunc.PythonModel):
         self._log_table = os.environ.get("LOG_TABLE_NAME", self._log_table)
         self._warehouse_id = os.environ.get("SQL_WAREHOUSE_ID", self._warehouse_id)
 
-        try:
-            config_path = (context.artifacts or {}).get("agent_config")
-            if config_path:
+        # Only read the artifact if it resolves to a real local file. During
+        # signature inference at log time the path may be unresolved; we must
+        # not crash there. At serving time MLflow resolves it to a local path.
+        config_path = (context.artifacts or {}).get("agent_config")
+        if config_path and os.path.exists(config_path):
+            try:
                 with open(config_path) as f:
                     cfg = json.load(f)
-                self._endpoint = cfg.get("llm_endpoint", self._endpoint)
-                self._index_name = cfg.get("vs_index_name", self._index_name)
-                self._log_table = cfg.get("log_table_name", self._log_table)
-                self._warehouse_id = cfg.get("warehouse_id", self._warehouse_id)
-        except Exception as exc:
-            raise RuntimeError(
-                f"load_context: failed to read agent_config artifact: {exc}"
-            ) from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"load_context: failed to parse agent_config artifact: {exc}"
+                ) from exc
+            self._endpoint = cfg.get("llm_endpoint", self._endpoint)
+            self._index_name = cfg.get("vs_index_name", self._index_name)
+            self._log_table = cfg.get("log_table_name", self._log_table)
+            self._warehouse_id = cfg.get("warehouse_id", self._warehouse_id)
 
         assert self._endpoint, "load_context: DATABRICKS_FM_ENDPOINT is not set"
         assert self._index_name, "load_context: VS_INDEX_NAME is not set"

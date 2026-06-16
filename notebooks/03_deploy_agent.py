@@ -161,8 +161,11 @@ logged_agent = AgentModel().configure(
     warehouse_id=SQL_WAREHOUSE_ID,
 )
 
-# Let MLflow infer the signature from the input_example. A hand-rolled string
-# signature would reject the real list-of-messages payload at log/serve time.
+# Build the signature explicitly from representative examples. infer_signature
+# does NOT invoke the model, so it can't trip over load_context — and Unity
+# Catalog requires every model to carry a signature.
+from mlflow.models import infer_signature
+
 input_example = {
     "messages": [
         {
@@ -171,26 +174,32 @@ input_example = {
         }
     ]
 }
+output_example = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "（サンプル応答）"}}
+    ]
+}
+signature = infer_signature(input_example, output_example)
 
 with mlflow.start_run(run_name="agent-registration") as run:
+    # Write config to a local path and hand that path to log_model, which copies
+    # it into the model artifacts. A runs:/ URI would not resolve during logging.
     tmp_config_path = f"/tmp/agent_config_{run.info.run_id}.json"
     with open(tmp_config_path, "w") as f:
         json.dump(agent_config, f)
-    mlflow.log_artifact(tmp_config_path, artifact_path="config")
-    os.unlink(tmp_config_path)
 
     model_info = mlflow.pyfunc.log_model(
-        artifact_path="agent_model",
+        name="agent_model",
         python_model=logged_agent,
         pip_requirements=pip_requirements,
         registered_model_name=MODEL_NAME,
         await_registration_for=300,
-        artifacts={
-            "agent_config": f"runs:/{run.info.run_id}/config/agent_config_{run.info.run_id}.json"
-        },
+        artifacts={"agent_config": tmp_config_path},
         resources=logged_agent.resources,
+        signature=signature,
         input_example=input_example,
     )
+    os.unlink(tmp_config_path)
     print(f"Model logged. Run ID: {run.info.run_id}")
     print(f"Model URI: {model_info.model_uri}")
     print(f"Registered version: {model_info.registered_model_version}")
