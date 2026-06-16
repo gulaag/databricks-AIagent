@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 import mlflow
@@ -22,6 +23,9 @@ from src.tools.logger import log_agent_action
 from src.tools.search import search_knowledge_base
 from src.tools.teams import post_to_teams
 
+_MAX_ITERATIONS = 5
+_WALL_TIME_SECONDS = 150
+
 
 class AgentModel(mlflow.pyfunc.PythonModel):
     """MLflow PyFunc wrapper that orchestrates the agentic tool-use loop.
@@ -32,46 +36,76 @@ class AgentModel(mlflow.pyfunc.PythonModel):
     """
 
     def __init__(self) -> None:
-        self._endpoint: str | None = None
-        self._teams_webhook: str | None = None
-        self._index_name: str | None = None
-        self._log_table: str | None = None
+        self._endpoint: str = "databricks-meta-llama-3-3-70b-instruct"
+        self._teams_webhook: str = ""
+        self._index_name: str = "main.tech_engineer.sessions_vs_index"
+        self._log_table: str = "main.tech_engineer.agent_action_log"
 
     def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
-        """Load runtime configuration from MLflow model artifacts or UC secrets."""
-        self._endpoint = os.environ.get(
-            "DATABRICKS_FM_ENDPOINT",
-            "databricks-meta-llama-3-3-70b-instruct",
-        )
+        """Load runtime configuration from artifact + env vars; crash on misconfiguration."""
+        self._endpoint = os.environ.get("DATABRICKS_FM_ENDPOINT", self._endpoint)
         self._teams_webhook = os.environ.get("TEAMS_WEBHOOK_URL", "")
-        self._index_name = os.environ.get(
-            "VS_INDEX_NAME",
-            "main.tech_engineer.sessions_vs_index",
+        self._index_name = os.environ.get("VS_INDEX_NAME", self._index_name)
+        self._log_table = os.environ.get("LOG_TABLE_NAME", self._log_table)
+
+        try:
+            config_path = (context.artifacts or {}).get("agent_config")
+            if config_path:
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                self._endpoint = cfg.get("llm_endpoint", self._endpoint)
+                self._index_name = cfg.get("vs_index_name", self._index_name)
+                self._log_table = cfg.get("log_table_name", self._log_table)
+        except Exception as exc:
+            raise RuntimeError(
+                f"load_context: failed to read agent_config artifact: {exc}"
+            ) from exc
+
+        assert self._endpoint, "load_context: DATABRICKS_FM_ENDPOINT is not set"
+        assert self._index_name, "load_context: VS_INDEX_NAME is not set"
+
+    @property
+    def resources(self) -> list:
+        """Declare UC resource dependencies for M2M OAuth injection in Model Serving."""
+        from mlflow.models.resources import (
+            DatabricksServingEndpoint,
+            DatabricksVectorSearchIndex,
         )
-        self._log_table = os.environ.get(
-            "LOG_TABLE_NAME",
-            "main.tech_engineer.agent_action_log",
-        )
+        return [
+            DatabricksVectorSearchIndex(index_name=self._index_name),
+            DatabricksServingEndpoint(endpoint_name=self._endpoint),
+        ]
 
     def predict(
         self,
         context: mlflow.pyfunc.PythonModelContext,
-        model_input: pd.DataFrame | dict[str, Any],
-    ) -> str:
+        model_input: pd.DataFrame | dict[str, Any] | list,
+    ) -> dict[str, Any]:
         """Run the agentic tool-use loop for a single user request.
 
         Args:
             context: MLflow context object (unused at inference time).
-            model_input: Either a DataFrame with a ``"messages"`` column or a
-                dict with key ``"messages"`` containing a list of chat messages.
+            model_input: Accepts three shapes:
+                - ``pd.DataFrame`` with a ``"messages"`` column (serving path)
+                - ``dict`` with ``"messages"`` key (notebook testing path)
+                - ``list`` of message dicts (Databricks AI Playground path)
 
         Returns:
-            The final assistant response as a plain string.
+            OpenAI-compatible envelope:
+            ``{"choices": [{"message": {"role": "assistant", "content": str}}]}``.
         """
         if isinstance(model_input, pd.DataFrame):
             messages: list[dict] = model_input["messages"].iloc[0]
-        else:
+        elif isinstance(model_input, list):
+            messages = model_input
+        elif isinstance(model_input, dict):
             messages = model_input.get("messages", [])
+            if not messages:
+                raw = model_input.get("input", "")
+                if isinstance(raw, str) and raw:
+                    messages = [{"role": "user", "content": raw}]
+        else:
+            raise ValueError(f"Unsupported model_input type: {type(model_input)}")
 
         conversation: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -79,20 +113,25 @@ class AgentModel(mlflow.pyfunc.PythonModel):
         ]
 
         with mlflow.start_run(nested=True):
-            return self._run_tool_loop(conversation)
+            final_answer = self._run_tool_loop(conversation)
+
+        return {"choices": [{"message": {"role": "assistant", "content": final_answer}}]}
 
     def _run_tool_loop(self, conversation: list[dict]) -> str:
         """Execute the ReAct tool-use loop until the LLM stops calling tools."""
-        max_iterations = 10
+        deadline = time.monotonic() + _WALL_TIME_SECONDS
 
-        for _ in range(max_iterations):
+        for iteration in range(_MAX_ITERATIONS):
+            if time.monotonic() > deadline:
+                return f"ERROR: Agent timed out after {_WALL_TIME_SECONDS} seconds."
+
             response = self._call_llm(conversation)
             message = response["choices"][0]["message"]
             conversation.append(message)
 
             tool_calls = message.get("tool_calls")
             if not tool_calls:
-                return message.get("content", "")
+                return self._enforce_citations(message.get("content", ""), conversation)
 
             for tc in tool_calls:
                 tool_result = self._dispatch_tool(tc)
@@ -104,7 +143,46 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                     }
                 )
 
+            conversation.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"[System: Iteration {iteration + 1} of {_MAX_ITERATIONS}. "
+                        "Continue following the execution order in your instructions. "
+                        "If you have retrieved context and drafted the announcement, "
+                        "call post_to_teams next, then log_agent_action.]"
+                    ),
+                }
+            )
+
         return "ERROR: Agent exceeded maximum iteration limit."
+
+    def _enforce_citations(self, answer: str, conversation: list[dict]) -> str:
+        """Append [Source:] tags if search was used but the LLM omitted them."""
+        retrieval_was_used = any(
+            tc.get("function", {}).get("name") == "search_knowledge_base"
+            for msg in conversation
+            for tc in (msg.get("tool_calls") or [])
+        )
+        if not retrieval_was_used or "[Source:" in answer:
+            return answer
+
+        sources: list[str] = []
+        for msg in conversation:
+            if msg.get("role") == "tool":
+                try:
+                    tool_result = json.loads(msg["content"])
+                    if isinstance(tool_result, list):
+                        for r in tool_result:
+                            src = r.get("metadata", {}).get("source_file")
+                            if src and src not in sources:
+                                sources.append(src)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        if sources:
+            answer += "\n\n[Source: " + ", ".join(sources) + "]"
+        return answer
 
     def _call_llm(self, messages: list[dict]) -> dict:
         """POST to the Databricks Foundation Model API chat completions endpoint."""
@@ -137,6 +215,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                 query=args["query"],
                 index_name=self._index_name,
                 num_results=args.get("num_results", 5),
+                similarity_threshold=args.get("similarity_threshold", 0.6),
             )
 
         if name == "post_to_teams":
