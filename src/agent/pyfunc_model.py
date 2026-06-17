@@ -52,8 +52,9 @@ class AgentModel(mlflow.pyfunc.PythonModel):
         index_name: str | None = None,
         log_table: str | None = None,
         warehouse_id: str | None = None,
+        webhook: str | None = None,
     ) -> "AgentModel":
-        """Set configuration explicitly before logging (used by the deploy notebook).
+        """Set configuration explicitly before logging or for direct notebook runs.
 
         Returns self so the call can be chained into log_model / resources.
         """
@@ -65,6 +66,8 @@ class AgentModel(mlflow.pyfunc.PythonModel):
             self._log_table = log_table
         if warehouse_id is not None:
             self._warehouse_id = warehouse_id
+        if webhook is not None:
+            self._webhook = webhook
         return self
 
     def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
