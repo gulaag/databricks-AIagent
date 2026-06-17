@@ -1,15 +1,16 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 04 — Run the Action Agent (interactive demo)
+# MAGIC # 04 — Run the Action Agent (interactive demo, with human approval)
 # MAGIC
-# MAGIC This is the live demo. Type a request, run the agent end-to-end:
+# MAGIC The agent runs in two phases, with a **confirmation gate** in between:
 # MAGIC
-# MAGIC **understand → decompose → search knowledge → draft a 1-hour agenda →
-# MAGIC post to the test Slack channel → log the run.**
+# MAGIC 1. **Draft** — understand the request → search the knowledge base → write the
+# MAGIC    agenda + announcement. **Nothing is posted yet.**
+# MAGIC 2. **Review** — you read exactly what will be sent.
+# MAGIC 3. **Send** — only if you set the confirmation widget to `yes`, the agent posts
+# MAGIC    the announcement to the Slack test channel and logs the action.
 # MAGIC
-# MAGIC No Model Serving endpoint required — the agent runs directly here, which is
-# MAGIC cheaper and simpler to present. (Notebook 03 shows how it would be deployed
-# MAGIC as a REST endpoint if/when that's needed.)
+# MAGIC No Model Serving endpoint required — the agent runs directly here.
 # MAGIC
 # MAGIC **Prerequisite:** run `01_data_ingestion.py` first so the Vector Search index exists.
 
@@ -37,7 +38,7 @@ WEBHOOK_URL = dbutils.secrets.get(scope="agent_secrets", key="slack_webhook_url"
 # COMMAND ----------
 
 # MAGIC %md ## Step 1 — Enter the request
-# MAGIC Edit the text widget at the top of the notebook, or keep the sample below.
+# MAGIC Edit the `user_request` widget at the top of the notebook, or keep the sample.
 
 # COMMAND ----------
 
@@ -48,6 +49,7 @@ dbutils.widgets.text(
     "テスト用チャンネルに投稿してください。",
     "User request",
 )
+dbutils.widgets.dropdown("confirm_send", "no", ["no", "yes"], "Confirm: send to Slack?")
 
 user_request = dbutils.widgets.get("user_request")
 print("Request:\n" + user_request)
@@ -82,21 +84,40 @@ print("Agent ready.")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 3 — Run the agent (this posts to Slack)
-# MAGIC Open the MLflow run/trace from the cell output to watch each tool call:
-# MAGIC `search_knowledge_base` → `post_to_channel` → `log_agent_action`.
+# MAGIC %md ## Step 3 — DRAFT (nothing is posted)
+# MAGIC The agent searches and writes the announcement. Review the output below — this
+# MAGIC is the **exact** text that will be sent if you approve.
 
 # COMMAND ----------
 
-with mlflow.start_run(run_name="agent-demo"):
-    result = agent.predict(_Ctx(), {"messages": [{"role": "user", "content": user_request}]})
+with mlflow.start_run(run_name="agent-draft"):
+    draft = agent.draft_announcement(user_request)
 
-answer = result["choices"][0]["message"]["content"]
-print(answer)
+print("================ DRAFT (review before sending) ================\n")
+print(draft["message"])
+print("\n================ sources used ================")
+print(draft["sources"] or "(none)")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 4 — Show the execution log (the audit trail)
+# MAGIC %md ## Step 4 — CONFIRM & SEND
+# MAGIC To send: set the **`Confirm: send to Slack?`** widget to `yes`, then run this cell.
+# MAGIC It posts exactly the draft shown above. To revise instead, edit the request and
+# MAGIC re-run Step 3.
+
+# COMMAND ----------
+
+if dbutils.widgets.get("confirm_send") == "yes":
+    with mlflow.start_run(run_name="agent-send"):
+        result = agent.send_announcement(draft["message"])
+    print(result["post_status"])
+    print(result["log_status"])
+else:
+    print("Not sent. Review the draft above, set 'Confirm: send to Slack?' = yes, then re-run.")
+
+# COMMAND ----------
+
+# MAGIC %md ## Step 5 — Execution log (the audit trail)
 
 # COMMAND ----------
 

@@ -15,9 +15,39 @@ import mlflow
 import requests
 
 
+_SLACK_SECTION_LIMIT = 2900  # Slack mrkdwn section text limit is 3000; stay under it.
+
+
+def _chunk(text: str, size: int = _SLACK_SECTION_LIMIT) -> list[str]:
+    """Split text into <=size pieces so each fits one Slack section block."""
+    return [text[i : i + size] for i in range(0, len(text), size)] or [" "]
+
+
 def _slack_payload(message: str) -> dict:
-    """Build a Slack incoming-webhook payload."""
-    return {"text": message}
+    """Build a Slack incoming-webhook Block Kit payload (polished card layout)."""
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "📢 Tech Engineer 勉強会 — 案内",
+                "emoji": True,
+            },
+        }
+    ]
+    for chunk in _chunk(message):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+    blocks.append({"type": "divider"})
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": "🤖 Databricks Action Agent が自動生成しました"}
+            ],
+        }
+    )
+    # `text` is the notification fallback shown in previews / older clients.
+    return {"text": message[:3000], "blocks": blocks}
 
 
 def _teams_payload(message: str) -> dict:

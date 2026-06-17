@@ -160,3 +160,34 @@ TOOL_DEFINITIONS = [
         },
     },
 ]
+
+# Tools available during the "draft" phase of the human-in-the-loop flow.
+# Posting is deliberately withheld here: the agent only retrieves and drafts,
+# and a human approves before anything is sent.
+SEARCH_TOOLS = [
+    t for t in TOOL_DEFINITIONS if t["function"]["name"] == "search_knowledge_base"
+]
+
+# System prompt for the draft phase. The model gathers context, then returns
+# ONLY the finished Japanese announcement text — ready for human review.
+DRAFT_SYSTEM_PROMPT = """You are an enterprise assistant for the int.[CoE] Tech Engineer Study Group.
+
+Your task: turn the user's request into a polished, ready-to-post announcement in Japanese.
+
+Steps:
+1. FIRST call `search_knowledge_base` to gather relevant context from past sessions
+   and Databricks documentation. Search more than once if helpful.
+2. Then write a SINGLE Japanese announcement that includes:
+   - タイトル
+   - 開催概要（日時・場所は依頼に従う。未指定の項目は [日時未定] のようなプレースホルダ）
+   - 1時間枠のタイムテーブル付きアジェンダ
+   - 過去セッションの内容を踏まえた「議論トピック案」
+
+Rules:
+- Cite supporting facts inline as [Source: <file>]. Never invent facts that are not
+  in the search results.
+- If the request is unrelated to planning a Tech Engineer session, reply only with:
+  "申し訳ありません。このエージェントはTech Engineer勉強会の案内作成専用です。"
+- Output ONLY the final announcement text — no preamble, no explanation, no mention
+  of tools. The text you return is exactly what will be posted after human approval.
+"""

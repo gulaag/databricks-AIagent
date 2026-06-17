@@ -17,7 +17,12 @@ import mlflow
 import mlflow.pyfunc
 import pandas as pd
 
-from src.agent.prompts import SYSTEM_PROMPT, TOOL_DEFINITIONS
+from src.agent.prompts import (
+    DRAFT_SYSTEM_PROMPT,
+    SEARCH_TOOLS,
+    SYSTEM_PROMPT,
+    TOOL_DEFINITIONS,
+)
 from src.tools.logger import log_agent_action
 from src.tools.messaging import post_to_channel
 from src.tools.search import search_knowledge_base
@@ -150,10 +155,50 @@ class AgentModel(mlflow.pyfunc.PythonModel):
             *messages,
         ]
 
-        final_answer = self._run_tool_loop(conversation)
+        final_answer = self._run_tool_loop(conversation, TOOL_DEFINITIONS)
         return {"choices": [{"message": {"role": "assistant", "content": final_answer}}]}
 
-    def _run_tool_loop(self, conversation: list[dict]) -> str:
+    # ------------------------------------------------------------------
+    # Human-in-the-loop API (used by the demo notebook)
+    # ------------------------------------------------------------------
+    def draft_announcement(self, user_request: str) -> dict[str, Any]:
+        """Draft an announcement WITHOUT posting it.
+
+        The agent searches the knowledge base and writes the announcement, but the
+        posting tool is withheld — nothing is sent. The returned text is exactly
+        what ``send_announcement`` will post once a human approves it.
+
+        Returns:
+            ``{"message": <draft text>, "sources": [<source_file>, ...]}``.
+        """
+        conversation: list[dict] = [
+            {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_request},
+        ]
+        message = self._run_tool_loop(conversation, SEARCH_TOOLS)
+        return {"message": message, "sources": self._collect_sources(conversation)}
+
+    def send_announcement(self, message: str) -> dict[str, str]:
+        """Post an already-approved announcement and log the action.
+
+        Call this only after a human has reviewed the draft from
+        ``draft_announcement``. Posts exactly the text passed in (WYSIWYG).
+        """
+        post_status = post_to_channel(message=message, webhook_url=self._webhook)
+        log_status = log_agent_action(
+            action_name="post_to_channel",
+            input_payload={"message": message[:500]},
+            output_payload={"result": post_status},
+            table_name=self._log_table,
+            status="SUCCESS" if post_status.startswith("SUCCESS") else "FAILURE",
+            warehouse_id=self._warehouse_id or None,
+        )
+        return {"post_status": post_status, "log_status": log_status}
+
+    # ------------------------------------------------------------------
+    # Tool loop
+    # ------------------------------------------------------------------
+    def _run_tool_loop(self, conversation: list[dict], tools: list[dict]) -> str:
         """Execute the ReAct tool-use loop until the LLM stops calling tools."""
         deadline = time.monotonic() + _WALL_TIME_SECONDS
 
@@ -161,7 +206,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
             if time.monotonic() > deadline:
                 return f"ERROR: Agent timed out after {_WALL_TIME_SECONDS} seconds."
 
-            response = self._call_llm(conversation)
+            response = self._call_llm(conversation, tools)
             message = response["choices"][0]["message"]
             conversation.append(message)
 
@@ -184,25 +229,16 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                     "role": "user",
                     "content": (
                         f"[System: Iteration {iteration + 1} of {_MAX_ITERATIONS}. "
-                        "Continue following the execution order in your instructions. "
-                        "If you have retrieved context and drafted the announcement, "
-                        "call post_to_channel next, then log_agent_action.]"
+                        "Continue following your instructions. When the announcement is "
+                        "ready, complete the required steps and give your final response.]"
                     ),
                 }
             )
 
         return "ERROR: Agent exceeded maximum iteration limit."
 
-    def _enforce_citations(self, answer: str, conversation: list[dict]) -> str:
-        """Append [Source:] tags if search was used but the LLM omitted them."""
-        retrieval_was_used = any(
-            tc.get("function", {}).get("name") == "search_knowledge_base"
-            for msg in conversation
-            for tc in (msg.get("tool_calls") or [])
-        )
-        if not retrieval_was_used or "[Source:" in answer:
-            return answer
-
+    def _collect_sources(self, conversation: list[dict]) -> list[str]:
+        """Gather unique source_file values from search results in the conversation."""
         sources: list[str] = []
         for msg in conversation:
             if msg.get("role") == "tool":
@@ -215,12 +251,24 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                                 sources.append(src)
                 except (json.JSONDecodeError, AttributeError):
                     pass
+        return sources
 
+    def _enforce_citations(self, answer: str, conversation: list[dict]) -> str:
+        """Append [Source:] tags if search was used but the LLM omitted them."""
+        retrieval_was_used = any(
+            tc.get("function", {}).get("name") == "search_knowledge_base"
+            for msg in conversation
+            for tc in (msg.get("tool_calls") or [])
+        )
+        if not retrieval_was_used or "[Source:" in answer:
+            return answer
+
+        sources = self._collect_sources(conversation)
         if sources:
             answer += "\n\n[Source: " + ", ".join(sources) + "]"
         return answer
 
-    def _call_llm(self, messages: list[dict]) -> dict:
+    def _call_llm(self, messages: list[dict], tools: list[dict]) -> dict:
         """Call the Databricks Foundation Model endpoint via the deployments client.
 
         Using ``get_deploy_client("databricks")`` (rather than a raw token POST)
@@ -234,7 +282,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
             endpoint=self._endpoint,
             inputs={
                 "messages": messages,
-                "tools": TOOL_DEFINITIONS,
+                "tools": tools,
                 "tool_choice": "auto",
                 "max_tokens": 2048,
                 "temperature": 0.2,
