@@ -245,7 +245,7 @@ served_model = ServedModelInput(
     workload_size=ServedModelInputWorkloadSize.SMALL,
     scale_to_zero_enabled=True,
     environment_vars={
-        "TEAMS_WEBHOOK_URL": "{{secrets/agent_secrets/teams_webhook_url}}",
+        "WEBHOOK_URL": "{{secrets/agent_secrets/slack_webhook_url}}",
         "VS_INDEX_NAME": VS_INDEX_NAME,
         "LOG_TABLE_NAME": LOG_TABLE_NAME,
         "SQL_WAREHOUSE_ID": SQL_WAREHOUSE_ID,
@@ -311,7 +311,7 @@ test_payload = {
             "content": (
                 "来週のTech Engineer共有会で「Databricks AI Agent入門」をテーマにしたいです。"
                 "1時間枠のアジェンダを作成し、社内向けの案内文を作って、"
-                "テスト用Teamsチャンネルに投稿してください。"
+                "テスト用Slackチャンネルに投稿してください。"
             ),
         }
     ]

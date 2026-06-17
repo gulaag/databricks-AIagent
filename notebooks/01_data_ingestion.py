@@ -292,8 +292,13 @@ def _trigger_vs_sync(host: str, token: str, index_name: str) -> dict:
     return resp.json()
 
 
-def _poll_vs_status(host: str, token: str, index_name: str, timeout_s: int = 600) -> None:
-    """Poll VS index status until ONLINE or timeout. Handles both API response shapes."""
+def _poll_vs_status(host: str, token: str, index_name: str, timeout_s: int = 1800) -> None:
+    """Poll VS index status until ONLINE or timeout. Handles both API response shapes.
+
+    First provisioning of a new index can take many minutes, hence the long
+    default timeout. A FAILED pipeline state is surfaced immediately rather than
+    waited on.
+    """
     url = f"https://{host}/api/2.0/vector-search/indexes/{index_name}"
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -302,17 +307,27 @@ def _poll_vs_status(host: str, token: str, index_name: str, timeout_s: int = 600
         )
         resp.raise_for_status()
         body = resp.json()
-        status = (
+        status = str(
             body.get("status", {}).get("detailed_state")
             or body.get("result", {}).get("status", "UNKNOWN")
-        )
+        ).upper()
         print(f"VS index status: {status}")
-        if "ONLINE" in str(status).upper():
+        if "FAILED" in status:
+            raise RuntimeError(f"VS index pipeline failed: {status}")
+        if "ONLINE" in status:
             print(f"VS index is online: {VS_INDEX_NAME}")
             return
         time.sleep(15)
     raise TimeoutError(f"VS index did not come online within {timeout_s}s")
 
 
-_retryable_call(lambda: _trigger_vs_sync(DATABRICKS_HOST, DATABRICKS_TOKEN, VS_INDEX_NAME))
+# Trigger a sync best-effort: a newly created index is still provisioning and
+# auto-runs its first sync, so the manual trigger may legitimately fail here.
+# Either way we then poll until the index reports ONLINE.
+try:
+    _retryable_call(lambda: _trigger_vs_sync(DATABRICKS_HOST, DATABRICKS_TOKEN, VS_INDEX_NAME))
+    print("Sync trigger accepted.")
+except Exception as exc:
+    print(f"Sync trigger not accepted yet ({exc}); relying on the automatic sync.")
+
 _poll_vs_status(DATABRICKS_HOST, DATABRICKS_TOKEN, VS_INDEX_NAME)

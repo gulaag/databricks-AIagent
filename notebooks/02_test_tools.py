@@ -28,9 +28,12 @@ LOG_TABLE_NAME = "main.tech_engineer.agent_action_log"
 # ID to exercise the same statement-execution path used at serving time.
 SQL_WAREHOUSE_ID = ""
 
-# Teams webhook URL — retrieve from UC secrets at runtime:
-# TEAMS_WEBHOOK_URL = dbutils.secrets.get(scope="agent_secrets", key="teams_webhook_url")
-TEAMS_WEBHOOK_URL = ""  # Replace with your test webhook URL
+# Webhook (Slack or Teams) read from a Databricks secret — never hard-coded.
+# Stored once via: databricks secrets put-secret agent_secrets slack_webhook_url
+try:
+    WEBHOOK_URL = dbutils.secrets.get(scope="agent_secrets", key="slack_webhook_url")
+except Exception:
+    WEBHOOK_URL = ""  # secret not configured; Test 2 will be skipped
 
 # COMMAND ----------
 
@@ -57,11 +60,11 @@ with mlflow.start_run(run_name="test_search"):
 
 # COMMAND ----------
 
-# MAGIC %md ## Test 2 — Teams webhook (uses a test/dry-run channel)
+# MAGIC %md ## Test 2 — Channel webhook (Slack or Teams test channel)
 
 # COMMAND ----------
 
-from src.tools.teams import post_to_teams
+from src.tools.messaging import post_to_channel
 
 test_agenda = """
 【テスト投稿】Tech Engineer 勉強会 — Databricks AI Agent 入門
@@ -78,13 +81,13 @@ test_agenda = """
 ※ このメッセージはテスト投稿です。
 """
 
-if TEAMS_WEBHOOK_URL:
-    with mlflow.start_run(run_name="test_teams_post"):
-        result = post_to_teams(agenda_content=test_agenda, webhook_url=TEAMS_WEBHOOK_URL)
+if WEBHOOK_URL:
+    with mlflow.start_run(run_name="test_channel_post"):
+        result = post_to_channel(message=test_agenda, webhook_url=WEBHOOK_URL)
         mlflow.log_param("post_result", result)
         print(result)
 else:
-    print("SKIPPED: Set TEAMS_WEBHOOK_URL to run this test.")
+    print("SKIPPED: webhook secret not configured (agent_secrets/slack_webhook_url).")
 
 # COMMAND ----------
 

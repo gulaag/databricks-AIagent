@@ -19,8 +19,8 @@ import pandas as pd
 
 from src.agent.prompts import SYSTEM_PROMPT, TOOL_DEFINITIONS
 from src.tools.logger import log_agent_action
+from src.tools.messaging import post_to_channel
 from src.tools.search import search_knowledge_base
-from src.tools.teams import post_to_teams
 
 _MAX_ITERATIONS = 5
 _WALL_TIME_SECONDS = 150
@@ -41,7 +41,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
 
     def __init__(self) -> None:
         self._endpoint: str = "databricks-meta-llama-3-3-70b-instruct"
-        self._teams_webhook: str = ""
+        self._webhook: str = ""
         self._index_name: str = "main.tech_engineer.sessions_vs_index"
         self._log_table: str = "main.tech_engineer.agent_action_log"
         self._warehouse_id: str = ""
@@ -70,7 +70,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
     def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
         """Load runtime configuration from artifact + env vars; crash on misconfiguration."""
         self._endpoint = os.environ.get("DATABRICKS_FM_ENDPOINT", self._endpoint)
-        self._teams_webhook = os.environ.get("TEAMS_WEBHOOK_URL", self._teams_webhook)
+        self._webhook = os.environ.get("WEBHOOK_URL", self._webhook)
         self._index_name = os.environ.get("VS_INDEX_NAME", self._index_name)
         self._log_table = os.environ.get("LOG_TABLE_NAME", self._log_table)
         self._warehouse_id = os.environ.get("SQL_WAREHOUSE_ID", self._warehouse_id)
@@ -183,7 +183,7 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                         f"[System: Iteration {iteration + 1} of {_MAX_ITERATIONS}. "
                         "Continue following the execution order in your instructions. "
                         "If you have retrieved context and drafted the announcement, "
-                        "call post_to_teams next, then log_agent_action.]"
+                        "call post_to_channel next, then log_agent_action.]"
                     ),
                 }
             )
@@ -251,10 +251,10 @@ class AgentModel(mlflow.pyfunc.PythonModel):
                 similarity_threshold=args.get("similarity_threshold", 0.6),
             )
 
-        if name == "post_to_teams":
-            return post_to_teams(
-                agenda_content=args["agenda_content"],
-                webhook_url=self._teams_webhook,
+        if name == "post_to_channel":
+            return post_to_channel(
+                message=args["message"],
+                webhook_url=self._webhook,
             )
 
         if name == "log_agent_action":

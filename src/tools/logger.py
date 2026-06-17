@@ -99,7 +99,7 @@ def log_agent_action(
     """Append a structured action log record to a Unity Catalog Delta table.
 
     Args:
-        action_name: Name of the tool/action being logged, e.g. ``"post_to_teams"``.
+        action_name: Name of the tool/action being logged, e.g. ``"post_to_channel"``.
         input_payload: Dict of inputs passed to the action.
         output_payload: Dict of outputs returned by the action.
         table_name: Fully-qualified UC table name, e.g.
