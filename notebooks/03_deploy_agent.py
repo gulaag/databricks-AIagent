@@ -23,7 +23,10 @@ import time
 import mlflow
 import mlflow.pyfunc
 
-sys.path.insert(0, "/Workspace/Users/digvijay@arsaga.jp/databricks-AIagent")
+# Repo root: used both to import src here AND to package src into the model so
+# the serving container can import it (otherwise: ModuleNotFoundError: 'src').
+REPO_ROOT = "/Workspace/Users/digvijay@arsaga.jp/databricks-AIagent"
+sys.path.insert(0, REPO_ROOT)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -191,6 +194,9 @@ with mlflow.start_run(run_name="agent-registration") as run:
     model_info = mlflow.pyfunc.log_model(
         name="agent_model",
         python_model=logged_agent,
+        # Ship the src package inside the model so the serving container can
+        # import src.agent.* / src.tools.* at load time.
+        code_paths=[f"{REPO_ROOT}/src"],
         pip_requirements=pip_requirements,
         registered_model_name=MODEL_NAME,
         await_registration_for=300,
@@ -274,8 +280,13 @@ else:
 # COMMAND ----------
 
 
-def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int = 900) -> None:
-    """Poll until the endpoint reports ready=READY or raises TimeoutError."""
+def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int = 2400) -> None:
+    """Poll until the endpoint reports ready=READY, or fail fast on UPDATE_FAILED.
+
+    First-time serving builds (container + deps + compute) can take 10-30 min,
+    hence the long timeout. A failed update is surfaced immediately instead of
+    waiting out the clock.
+    """
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         ep = wc.serving_endpoints.get(name=endpoint_name)
@@ -285,6 +296,11 @@ def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int =
         if ready == "READY":
             print(f"Endpoint {endpoint_name} is ready.")
             return
+        if state == "UPDATE_FAILED":
+            raise RuntimeError(
+                f"Endpoint {endpoint_name} update FAILED. Check Serving > "
+                f"{endpoint_name} > build/service logs in the UI."
+            )
         time.sleep(30)
     raise TimeoutError(
         f"Endpoint {endpoint_name} did not become ready within {timeout_s}s"
