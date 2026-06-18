@@ -269,17 +269,21 @@ from databricks.sdk.service.serving import (
 
 w = WorkspaceClient()
 
+# Only include SQL_WAREHOUSE_ID when set — an empty env-var value can be rejected.
+env_vars = {
+    "WEBHOOK_URL": "{{secrets/agent_secrets/slack_webhook_url}}",
+    "VS_INDEX_NAME": VS_INDEX_NAME,
+    "LOG_TABLE_NAME": LOG_TABLE_NAME,
+}
+if SQL_WAREHOUSE_ID:
+    env_vars["SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
+
 served_model = ServedModelInput(
     model_name=MODEL_NAME,
     model_version=str(latest_version),
     workload_size=ServedModelInputWorkloadSize.SMALL,
     scale_to_zero_enabled=True,
-    environment_vars={
-        "WEBHOOK_URL": "{{secrets/agent_secrets/slack_webhook_url}}",
-        "VS_INDEX_NAME": VS_INDEX_NAME,
-        "LOG_TABLE_NAME": LOG_TABLE_NAME,
-        "SQL_WAREHOUSE_ID": SQL_WAREHOUSE_ID,
-    },
+    environment_vars=env_vars,
 )
 
 endpoint_config = EndpointCoreConfigInput(served_models=[served_model])

@@ -186,6 +186,9 @@ Steps:
 Rules:
 - Cite supporting facts inline as [Source: <file>]. Never invent facts that are not
   in the search results.
+- Format for Slack: plain text with emoji as section markers (例: 📅 日時, 🕐 アジェンダ,
+  📝 議論トピック案) and simple "・" bullets. Use *single asterisks* for emphasis. Do NOT
+  use Markdown headings (#), tables, or **double asterisks** — Slack renders them literally.
 - If the request is unrelated to planning a Tech Engineer session, reply only with:
   "申し訳ありません。このエージェントはTech Engineer勉強会の案内作成専用です。"
 - Output ONLY the final announcement text — no preamble, no explanation, no mention
