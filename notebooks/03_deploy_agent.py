@@ -17,6 +17,7 @@
 
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -184,6 +185,13 @@ output_example = {
 }
 signature = infer_signature(input_example, output_example)
 
+# Stage src to local disk: MLflow refuses to copy code_paths from a /Workspace
+# Repo path (it may contain notebook objects). A plain local copy copies cleanly.
+LOCAL_SRC = "/tmp/agent_code/src"
+shutil.rmtree("/tmp/agent_code", ignore_errors=True)
+shutil.copytree(f"{REPO_ROOT}/src", LOCAL_SRC)
+print(f"Staged src to {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
+
 with mlflow.start_run(run_name="agent-registration") as run:
     # Write config to a local path and hand that path to log_model, which copies
     # it into the model artifacts. A runs:/ URI would not resolve during logging.
@@ -195,8 +203,8 @@ with mlflow.start_run(run_name="agent-registration") as run:
         name="agent_model",
         python_model=logged_agent,
         # Ship the src package inside the model so the serving container can
-        # import src.agent.* / src.tools.* at load time.
-        code_paths=[f"{REPO_ROOT}/src"],
+        # import src.agent.* / src.tools.* at load time (staged to local disk).
+        code_paths=[LOCAL_SRC],
         pip_requirements=pip_requirements,
         registered_model_name=MODEL_NAME,
         await_registration_for=300,
