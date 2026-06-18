@@ -185,12 +185,28 @@ output_example = {
 }
 signature = infer_signature(input_example, output_example)
 
-# Stage src to local disk: MLflow refuses to copy code_paths from a /Workspace
-# Repo path (it may contain notebook objects). A plain local copy copies cleanly.
+# Stage src to local disk for code_paths. MLflow refuses to copy from a /Workspace
+# Repo path (it may contain notebook objects), and the repo's real on-disk path can
+# differ from any hard-coded guess. So derive src's actual location from the import,
+# then copy only .py files (content only, no metadata) into a clean local dir.
+import src as _src_pkg
+
+SRC_DIR = (
+    os.path.dirname(_src_pkg.__file__)
+    if getattr(_src_pkg, "__file__", None)
+    else list(_src_pkg.__path__)[0]
+)
 LOCAL_SRC = "/tmp/agent_code/src"
 shutil.rmtree("/tmp/agent_code", ignore_errors=True)
-shutil.copytree(f"{REPO_ROOT}/src", LOCAL_SRC)
-print(f"Staged src to {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
+for _root, _dirs, _files in os.walk(SRC_DIR):
+    _dirs[:] = [d for d in _dirs if d != "__pycache__"]
+    _rel = os.path.relpath(_root, SRC_DIR)
+    _dest = LOCAL_SRC if _rel == "." else os.path.join(LOCAL_SRC, _rel)
+    os.makedirs(_dest, exist_ok=True)
+    for _fn in _files:
+        if _fn.endswith(".py"):
+            shutil.copyfile(os.path.join(_root, _fn), os.path.join(_dest, _fn))
+print(f"Staged src from {SRC_DIR} -> {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
 
 with mlflow.start_run(run_name="agent-registration") as run:
     # Write config to a local path and hand that path to log_model, which copies
