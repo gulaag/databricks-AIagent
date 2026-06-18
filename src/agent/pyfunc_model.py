@@ -122,41 +122,63 @@ class AgentModel(mlflow.pyfunc.PythonModel):
     def predict(
         self,
         context: mlflow.pyfunc.PythonModelContext,
-        model_input: pd.DataFrame | dict[str, Any] | list,
-    ) -> dict[str, Any]:
-        """Run the agentic tool-use loop for a single user request.
+        model_input: pd.DataFrame | dict[str, Any] | list | str,
+    ) -> list[str]:
+        """Run the autonomous agent for each request and return the answers.
+
+        Uses a simple, serving-robust contract: a ``query`` string in, a response
+        string out (row-aligned). This is the shape MLflow's scoring server handles
+        most reliably (``{"dataframe_records": [{"query": "..."}]}`` ->
+        ``{"predictions": ["..."]}``).
 
         Args:
             context: MLflow context object (unused at inference time).
-            model_input: Accepts three shapes:
-                - ``pd.DataFrame`` with a ``"messages"`` column (serving path)
-                - ``dict`` with ``"messages"`` key (notebook testing path)
-                - ``list`` of message dicts (Databricks AI Playground path)
+            model_input: One of:
+                - ``pd.DataFrame`` with a ``"query"`` column (serving path)
+                - ``dict`` ``{"query": "..."}`` or ``{"query": ["...", ...]}``
+                - ``dict`` ``{"messages": [...]}`` (chat-style; last user msg used)
+                - ``list`` of strings, or a single ``str``
 
         Returns:
-            OpenAI-compatible envelope:
-            ``{"choices": [{"message": {"role": "assistant", "content": str}}]}``.
+            A list of response strings, one per input row.
         """
-        if isinstance(model_input, pd.DataFrame):
-            messages: list[dict] = model_input["messages"].iloc[0]
-        elif isinstance(model_input, list):
-            messages = model_input
-        elif isinstance(model_input, dict):
-            messages = model_input.get("messages", [])
-            if not messages:
-                raw = model_input.get("input", "")
-                if isinstance(raw, str) and raw:
-                    messages = [{"role": "user", "content": raw}]
-        else:
-            raise ValueError(f"Unsupported model_input type: {type(model_input)}")
+        queries = self._to_queries(model_input)
+        return [self._answer_one(q) for q in queries]
 
+    def _to_queries(self, model_input: Any) -> list[str]:
+        """Normalise any supported input shape into a list of query strings."""
+        if isinstance(model_input, pd.DataFrame):
+            col = "query" if "query" in model_input.columns else model_input.columns[0]
+            return [str(v) for v in model_input[col].tolist()]
+        if isinstance(model_input, str):
+            return [model_input]
+        if isinstance(model_input, list):
+            if model_input and isinstance(model_input[0], dict):
+                return [self._last_user_content(model_input)]
+            return [str(v) for v in model_input]
+        if isinstance(model_input, dict):
+            if "query" in model_input:
+                v = model_input["query"]
+                return [str(x) for x in v] if isinstance(v, list) else [str(v)]
+            if "messages" in model_input:
+                return [self._last_user_content(model_input["messages"])]
+        raise ValueError(f"Unsupported model_input type: {type(model_input)}")
+
+    @staticmethod
+    def _last_user_content(messages: list[dict]) -> str:
+        """Extract the most recent user message content from a chat list."""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                return m.get("content", "")
+        return messages[-1].get("content", "") if messages else ""
+
+    def _answer_one(self, query: str) -> str:
+        """Run the full autonomous tool loop for a single query string."""
         conversation: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            *messages,
+            {"role": "user", "content": query},
         ]
-
-        final_answer = self._run_tool_loop(conversation, TOOL_DEFINITIONS)
-        return {"choices": [{"message": {"role": "assistant", "content": final_answer}}]}
+        return self._run_tool_loop(conversation, TOOL_DEFINITIONS)
 
     # ------------------------------------------------------------------
     # Human-in-the-loop API (used by the demo notebook)

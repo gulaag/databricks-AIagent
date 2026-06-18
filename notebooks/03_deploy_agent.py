@@ -65,40 +65,19 @@ class _MockContext:
 
 SMOKE_TESTS = [
     {
-        "input": {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Databricks Unity Catalogについて教えてください。",
-                }
-            ]
-        },
+        "query": "Databricks Unity Catalogについて教えてください。",
         "expected_signals": ["Unity Catalog"],
         "description": "Standard knowledge query",
     },
     {
-        "input": {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "過去のセッションでデータガバナンスについて話しましたか？",
-                }
-            ]
-        },
+        "query": "過去のセッションでデータガバナンスについて話しましたか？",
         # Pass if the answer either cites a source or gracefully reports no match.
         # Avoids a brittle hard dependency on specific index content.
         "expected_signals": ["Source", "ガバナンス", "見つかりません"],
         "description": "Retrieval answer is cited or gracefully empty",
     },
     {
-        "input": {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Pythonのクイックソートを実装してください。",
-                }
-            ]
-        },
+        "query": "Pythonのクイックソートを実装してください。",
         "expected_signals": ["対応できません"],
         "description": "Out-of-scope refusal",
     },
@@ -117,8 +96,8 @@ smoke_agent.load_context(_MockContext())
 failures = []
 for i, test in enumerate(SMOKE_TESTS):
     try:
-        result = smoke_agent.predict(_MockContext(), test["input"])
-        content = result["choices"][0]["message"]["content"]
+        result = smoke_agent.predict(_MockContext(), {"query": test["query"]})
+        content = result[0]
         if not any(sig in content for sig in test["expected_signals"]):
             failures.append(
                 f"Test {i + 1} ({test['description']}): "
@@ -143,6 +122,7 @@ print("\nAll smoke tests passed. Proceeding with model registration.")
 # Vector Search and SQL logging through databricks-sdk. All auth via M2M OAuth.
 pip_requirements = [
     "mlflow",
+    "pandas",
     "requests",
     "databricks-vectorsearch",
     "databricks-sdk",
@@ -167,22 +147,15 @@ logged_agent = AgentModel().configure(
 
 # Build the signature explicitly from representative examples. infer_signature
 # does NOT invoke the model, so it can't trip over load_context — and Unity
-# Catalog requires every model to carry a signature.
+# Catalog requires every model to carry a signature. Simple string-in/string-out
+# is the serving-robust contract: {"dataframe_records":[{"query":"..."}]} ->
+# {"predictions":["..."]}.
 from mlflow.models import infer_signature
 
 input_example = {
-    "messages": [
-        {
-            "role": "user",
-            "content": "来週のTech Engineer共有会のアジェンダを作成してください。",
-        }
-    ]
+    "query": ["来週のTech Engineer共有会のアジェンダを作成してください。"]
 }
-output_example = {
-    "choices": [
-        {"message": {"role": "assistant", "content": "（サンプル応答）"}}
-    ]
-}
+output_example = ["（サンプル応答）"]
 signature = infer_signature(input_example, output_example)
 
 # Stage src to local disk for code_paths. MLflow refuses to copy from a /Workspace
@@ -348,15 +321,18 @@ import requests
 token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 host = spark.conf.get("spark.databricks.workspaceUrl")
 
+# MLflow pyfunc endpoints require the dataframe_records / inputs / instances
+# envelope — a raw {"messages": ...} body is rejected as "Invalid input".
+# NOTE: the deployed agent is AUTONOMOUS — this call WILL post to Slack (there is
+# no approval gate here; that gate lives in notebook 04).
 test_payload = {
-    "messages": [
+    "dataframe_records": [
         {
-            "role": "user",
-            "content": (
+            "query": (
                 "来週のTech Engineer共有会で「Databricks AI Agent入門」をテーマにしたいです。"
                 "1時間枠のアジェンダを作成し、社内向けの案内文を作って、"
                 "テスト用Slackチャンネルに投稿してください。"
-            ),
+            )
         }
     ]
 }
@@ -369,4 +345,7 @@ response = requests.post(
 )
 
 print(f"Status: {response.status_code}")
-print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+body = response.json()
+print(json.dumps(body, ensure_ascii=False, indent=2))
+if response.status_code == 200 and "predictions" in body:
+    print("\n=== Agent response ===\n" + str(body["predictions"][0]))
