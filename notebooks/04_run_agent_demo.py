@@ -21,6 +21,7 @@
 
 # COMMAND ----------
 
+import os
 import sys
 
 # Repo root on the path so `src` imports resolve. Adjust if your repo folder differs.
@@ -31,6 +32,13 @@ SCHEMA = "tech_engineer"
 LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 VS_INDEX_NAME = f"{CATALOG}.{SCHEMA}.sessions_vs_index"
 LOG_TABLE_NAME = f"{CATALOG}.{SCHEMA}.agent_action_log"
+
+# Resolve workspace host + token so the agent's LLM and Vector Search clients work
+# when run locally in this notebook.
+os.environ["DATABRICKS_HOST"] = "https://" + spark.conf.get("spark.databricks.workspaceUrl")
+os.environ["DATABRICKS_TOKEN"] = (
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+)
 
 # Webhook read from a secret — never hard-coded.
 WEBHOOK_URL = dbutils.secrets.get(scope="agent_secrets", key="slack_webhook_url")

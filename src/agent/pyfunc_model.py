@@ -119,12 +119,11 @@ class AgentModel(mlflow.pyfunc.PythonModel):
             res.append(DatabricksSQLWarehouse(warehouse_id=self._warehouse_id))
         return res
 
-    def predict(
-        self,
-        context: mlflow.pyfunc.PythonModelContext,
-        model_input: pd.DataFrame | dict[str, Any] | list | str,
-    ) -> list[str]:
+    def predict(self, context, model_input):
         """Run the autonomous agent for each request and return the answers.
+
+        (No type hints on the signature: MLflow tries to derive a schema from them
+        and warns unless they are list[...]; we supply an explicit signature instead.)
 
         Uses a simple, serving-robust contract: a ``query`` string in, a response
         string out (row-aligned). This is the shape MLflow's scoring server handles

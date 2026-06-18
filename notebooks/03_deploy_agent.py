@@ -47,6 +47,14 @@ LOG_TABLE_NAME = "main.tech_engineer.agent_action_log"
 # empty to skip the SQL log path (the agent still runs; logging degrades gracefully).
 SQL_WAREHOUSE_ID = ""
 
+# Resolve workspace host + token so the agent's LLM and Vector Search clients work
+# when the agent is run locally here (the smoke tests). At serving time these are
+# provided automatically by injected M2M OAuth, so this is notebook-only.
+os.environ["DATABRICKS_HOST"] = "https://" + spark.conf.get("spark.databricks.workspaceUrl")
+os.environ["DATABRICKS_TOKEN"] = (
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+)
+
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(EXPERIMENT_PATH)
 
