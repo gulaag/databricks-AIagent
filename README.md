@@ -89,6 +89,8 @@ no `databricks_token` secret is needed.
 | `01_data_ingestion.py` | Parse PDF/Markdown/text, build Vector Search index |
 | `02_test_tools.py` | Validate each tool independently |
 | `03_deploy_agent.py` | Register model to UC, deploy serving endpoint |
+| `04_run_agent_demo.py` | Run the agent end-to-end with a human approval gate |
+| `05_conversational_demo.py` | Conversational agent: propose → refine → approve → act |
 
 ---
 
