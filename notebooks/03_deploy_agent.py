@@ -1,16 +1,22 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 03 — Register Agent to Unity Catalog & Deploy to Model Serving
+# MAGIC # 03 — Register the ResponsesAgent to Unity Catalog & Deploy to Model Serving
 # MAGIC
-# MAGIC **Purpose:** Smoke-test the agent locally, log it to Unity Catalog via MLflow,
-# MAGIC then deploy to a Databricks Model Serving endpoint.
+# MAGIC **Purpose:** Smoke-test the agent locally, log it to Unity Catalog via MLflow
+# MAGIC using the **`ResponsesAgent`** interface (the Databricks-recommended way to
+# MAGIC author agents), then deploy it to a Model Serving endpoint.
+# MAGIC
+# MAGIC **Why `ResponsesAgent`?** It gives the deployed endpoint out-of-the-box
+# MAGIC compatibility with the AI Playground, Agent Evaluation, and Agent Monitoring,
+# MAGIC a standard streaming contract, and an automatically-inferred signature.
 # MAGIC
 # MAGIC **Prerequisites:** Notebooks 01 and 02 must have been run successfully.
-# MAGIC **Cell order:** pre-registration smoke tests → log_model → alias → deploy → wait → live test
+# MAGIC **Cell order:** local smoke tests → log_model (models-from-code) → alias →
+# MAGIC deploy → wait → live test.
 
 # COMMAND ----------
 
-# MAGIC %pip install mlflow databricks-sdk databricks-vectorsearch --quiet
+# MAGIC %pip install -U "mlflow>=3.1" databricks-sdk databricks-vectorsearch --quiet
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -55,20 +61,44 @@ os.environ["DATABRICKS_TOKEN"] = (
     dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 )
 
+# The agent reads its config from env vars (see TechEngineerResponsesAgent.__init__).
+# Set them for the local smoke test so retrieval + logging target the right places.
+# NOTE: WEBHOOK_URL is intentionally LEFT UNSET here so that nothing can be posted
+# to Slack during registration. The deployed endpoint receives the webhook from a
+# secret (Step 4); the live post happens only in Step 6.
+os.environ["DATABRICKS_FM_ENDPOINT"] = LLM_ENDPOINT
+os.environ["VS_INDEX_NAME"] = VS_INDEX_NAME
+os.environ["LOG_TABLE_NAME"] = LOG_TABLE_NAME
+os.environ["SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
+os.environ.pop("WEBHOOK_URL", None)
+
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(EXPERIMENT_PATH)
 
 # COMMAND ----------
 
 # MAGIC %md ## Step 1 — Pre-registration smoke tests (must all pass before log_model)
+# MAGIC
+# MAGIC These exercise the `ResponsesAgent` locally with the Responses request shape
+# MAGIC (`{"input": [{"role": "user", "content": "..."}]}`). The queries are
+# MAGIC information / refusal cases — none ask the agent to post — so nothing is sent.
 
 # COMMAND ----------
 
-from src.agent.pyfunc_model import AgentModel
+from mlflow.types.responses import ResponsesAgentRequest
+
+from src.agent.responses_agent import TechEngineerResponsesAgent
 
 
-class _MockContext:
-    artifacts = {}
+def _final_text(output_items: list) -> str:
+    """Concatenate the text of every assistant `message` item in the output."""
+    texts: list[str] = []
+    for item in output_items:
+        if item.get("type") == "message":
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    texts.append(part.get("text", ""))
+    return "\n".join(texts)
 
 
 SMOKE_TESTS = [
@@ -80,7 +110,6 @@ SMOKE_TESTS = [
     {
         "query": "過去のセッションでデータガバナンスについて話しましたか？",
         # Pass if the answer either cites a source or gracefully reports no match.
-        # Avoids a brittle hard dependency on specific index content.
         "expected_signals": ["Source", "ガバナンス", "見つかりません"],
         "description": "Retrieval answer is cited or gracefully empty",
     },
@@ -91,21 +120,16 @@ SMOKE_TESTS = [
     },
 ]
 
-# Smoke-test instance is configured but kept separate from the instance we log,
-# so no inference-time state can leak into the pickled model artifact.
-smoke_agent = AgentModel().configure(
-    endpoint=LLM_ENDPOINT,
-    index_name=VS_INDEX_NAME,
-    log_table=LOG_TABLE_NAME,
-    warehouse_id=SQL_WAREHOUSE_ID,
-)
-smoke_agent.load_context(_MockContext())
+smoke_agent = TechEngineerResponsesAgent()
 
 failures = []
 for i, test in enumerate(SMOKE_TESTS):
     try:
-        result = smoke_agent.predict(_MockContext(), {"query": test["query"]})
-        content = result[0]
+        request = ResponsesAgentRequest(
+            input=[{"role": "user", "content": test["query"]}]
+        )
+        response = smoke_agent.predict(request)
+        content = _final_text(response.output)
         if not any(sig in content for sig in test["expected_signals"]):
             failures.append(
                 f"Test {i + 1} ({test['description']}): "
@@ -122,54 +146,29 @@ print("\nAll smoke tests passed. Proceeding with model registration.")
 
 # COMMAND ----------
 
-# MAGIC %md ## Step 2 — Log model to Unity Catalog
+# MAGIC %md ## Step 2 — Log the agent to Unity Catalog (models-from-code)
+# MAGIC
+# MAGIC `ResponsesAgent` models are logged via the *models-from-code* pattern: we
+# MAGIC point `python_model` at `agent_entry.py` (which calls `mlflow.models.set_model`)
+# MAGIC and ship the `src` package via `code_paths`. MLflow infers the signature from
+# MAGIC the `ResponsesAgent` schema automatically — we do not pass one.
 
 # COMMAND ----------
 
 # Serving container needs no Spark: the LLM call goes through mlflow.deployments,
 # Vector Search and SQL logging through databricks-sdk. All auth via M2M OAuth.
 pip_requirements = [
-    "mlflow",
-    "pandas",
+    "mlflow>=3.1",
     "requests",
     "databricks-vectorsearch",
     "databricks-sdk",
 ]
 
-agent_config = {
-    "llm_endpoint": LLM_ENDPOINT,
-    "vs_index_name": VS_INDEX_NAME,
-    "log_table_name": LOG_TABLE_NAME,
-    "warehouse_id": SQL_WAREHOUSE_ID,
-}
-
-# Fresh, explicitly-configured instance — never run through predict(), so the
-# pickled artifact carries no inference-time state. Its resources include the
-# SQL warehouse only when SQL_WAREHOUSE_ID is set.
-logged_agent = AgentModel().configure(
-    endpoint=LLM_ENDPOINT,
-    index_name=VS_INDEX_NAME,
-    log_table=LOG_TABLE_NAME,
-    warehouse_id=SQL_WAREHOUSE_ID,
-)
-
-# Build the signature explicitly from representative examples. infer_signature
-# does NOT invoke the model, so it can't trip over load_context — and Unity
-# Catalog requires every model to carry a signature. Simple string-in/string-out
-# is the serving-robust contract: {"dataframe_records":[{"query":"..."}]} ->
-# {"predictions":["..."]}.
-from mlflow.models import infer_signature
-
-input_example = {
-    "query": ["来週のTech Engineer共有会のアジェンダを作成してください。"]
-}
-output_example = ["（サンプル応答）"]
-signature = infer_signature(input_example, output_example)
-
 # Stage src to local disk for code_paths. MLflow refuses to copy from a /Workspace
 # Repo path (it may contain notebook objects), and the repo's real on-disk path can
 # differ from any hard-coded guess. So derive src's actual location from the import,
-# then copy only .py files (content only, no metadata) into a clean local dir.
+# then copy only .py files into a clean local dir. Stage agent_entry.py alongside
+# it (NOT inside src) and use that file as the models-from-code entry point.
 import src as _src_pkg
 
 SRC_DIR = (
@@ -177,8 +176,11 @@ SRC_DIR = (
     if getattr(_src_pkg, "__file__", None)
     else list(_src_pkg.__path__)[0]
 )
-LOCAL_SRC = "/tmp/agent_code/src"
-shutil.rmtree("/tmp/agent_code", ignore_errors=True)
+STAGE_DIR = "/tmp/agent_code"
+LOCAL_SRC = os.path.join(STAGE_DIR, "src")
+ENTRY_FILE = os.path.join(STAGE_DIR, "agent_entry.py")
+
+shutil.rmtree(STAGE_DIR, ignore_errors=True)
 for _root, _dirs, _files in os.walk(SRC_DIR):
     _dirs[:] = [d for d in _dirs if d != "__pycache__"]
     _rel = os.path.relpath(_root, SRC_DIR)
@@ -187,30 +189,42 @@ for _root, _dirs, _files in os.walk(SRC_DIR):
     for _fn in _files:
         if _fn.endswith(".py"):
             shutil.copyfile(os.path.join(_root, _fn), os.path.join(_dest, _fn))
-print(f"Staged src from {SRC_DIR} -> {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
+shutil.copyfile(os.path.join(REPO_ROOT, "agent_entry.py"), ENTRY_FILE)
+print(f"Staged src -> {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
+print(f"Staged entry -> {ENTRY_FILE}")
+
+# Declare the UC resources the agent depends on so Model Serving injects M2M OAuth.
+from mlflow.models.resources import (
+    DatabricksServingEndpoint,
+    DatabricksSQLWarehouse,
+    DatabricksVectorSearchIndex,
+)
+
+resources = [
+    DatabricksServingEndpoint(endpoint_name=LLM_ENDPOINT),
+    DatabricksVectorSearchIndex(index_name=VS_INDEX_NAME),
+]
+if SQL_WAREHOUSE_ID:
+    resources.append(DatabricksSQLWarehouse(warehouse_id=SQL_WAREHOUSE_ID))
+
+# A non-posting example request used for signature/example purposes.
+input_example = {
+    "input": [
+        {"role": "user", "content": "Databricks AI Agentとは何かを一言で教えてください。"}
+    ]
+}
 
 with mlflow.start_run(run_name="agent-registration") as run:
-    # Write config to a local path and hand that path to log_model, which copies
-    # it into the model artifacts. A runs:/ URI would not resolve during logging.
-    tmp_config_path = f"/tmp/agent_config_{run.info.run_id}.json"
-    with open(tmp_config_path, "w") as f:
-        json.dump(agent_config, f)
-
     model_info = mlflow.pyfunc.log_model(
         name="agent_model",
-        python_model=logged_agent,
-        # Ship the src package inside the model so the serving container can
-        # import src.agent.* / src.tools.* at load time (staged to local disk).
-        code_paths=[LOCAL_SRC],
+        python_model=ENTRY_FILE,          # models-from-code entry (calls set_model)
+        code_paths=[LOCAL_SRC],           # ship the src package for imports at load
         pip_requirements=pip_requirements,
         registered_model_name=MODEL_NAME,
-        await_registration_for=300,
-        artifacts={"agent_config": tmp_config_path},
-        resources=logged_agent.resources,
-        signature=signature,
+        resources=resources,
         input_example=input_example,
+        await_registration_for=300,
     )
-    os.unlink(tmp_config_path)
     print(f"Model logged. Run ID: {run.info.run_id}")
     print(f"Model URI: {model_info.model_uri}")
     print(f"Registered version: {model_info.registered_model_version}")
@@ -238,6 +252,9 @@ print(f"Set alias 'champion' -> version {latest_version} of {MODEL_NAME}")
 # COMMAND ----------
 
 # MAGIC %md ## Step 4 — Create or update the Model Serving endpoint
+# MAGIC
+# MAGIC The agent reads its config from env vars. `WEBHOOK_URL` comes from a secret
+# MAGIC so the webhook is never baked into the artifact or printed in logs.
 
 # COMMAND ----------
 
@@ -250,12 +267,13 @@ from databricks.sdk.service.serving import (
 
 w = WorkspaceClient()
 
-# Only include SQL_WAREHOUSE_ID when set — an empty env-var value can be rejected.
 env_vars = {
     "WEBHOOK_URL": "{{secrets/agent_secrets/slack_webhook_url}}",
+    "DATABRICKS_FM_ENDPOINT": LLM_ENDPOINT,
     "VS_INDEX_NAME": VS_INDEX_NAME,
     "LOG_TABLE_NAME": LOG_TABLE_NAME,
 }
+# Only include SQL_WAREHOUSE_ID when set — an empty env-var value can be rejected.
 if SQL_WAREHOUSE_ID:
     env_vars["SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
 
@@ -321,6 +339,13 @@ _wait_for_endpoint(w, SERVING_ENDPOINT_NAME)
 # COMMAND ----------
 
 # MAGIC %md ## Step 6 — Live endpoint smoke test
+# MAGIC
+# MAGIC `ResponsesAgent` endpoints accept the Responses request shape directly
+# MAGIC (`{"input": [...]}`) and return `{"output": [...]}`.
+# MAGIC
+# MAGIC **NOTE:** the deployed agent is AUTONOMOUS — this request asks it to post, so
+# MAGIC it **will** post to the Slack test channel. The human-approval demo lives in
+# MAGIC notebooks 04 / 05.
 
 # COMMAND ----------
 
@@ -329,18 +354,15 @@ import requests
 token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 host = spark.conf.get("spark.databricks.workspaceUrl")
 
-# MLflow pyfunc endpoints require the dataframe_records / inputs / instances
-# envelope — a raw {"messages": ...} body is rejected as "Invalid input".
-# NOTE: the deployed agent is AUTONOMOUS — this call WILL post to Slack (there is
-# no approval gate here; that gate lives in notebook 04).
 test_payload = {
-    "dataframe_records": [
+    "input": [
         {
-            "query": (
+            "role": "user",
+            "content": (
                 "来週のTech Engineer共有会で「Databricks AI Agent入門」をテーマにしたいです。"
                 "1時間枠のアジェンダを作成し、社内向けの案内文を作って、"
                 "テスト用Slackチャンネルに投稿してください。"
-            )
+            ),
         }
     ]
 }
@@ -349,11 +371,19 @@ response = requests.post(
     url=f"https://{host}/serving-endpoints/{SERVING_ENDPOINT_NAME}/invocations",
     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     json=test_payload,
-    timeout=120,
+    timeout=180,
 )
 
 print(f"Status: {response.status_code}")
 body = response.json()
 print(json.dumps(body, ensure_ascii=False, indent=2))
-if response.status_code == 200 and "predictions" in body:
-    print("\n=== Agent response ===\n" + str(body["predictions"][0]))
+
+if response.status_code == 200 and "output" in body:
+    texts = [
+        part.get("text", "")
+        for item in body["output"]
+        if item.get("type") == "message"
+        for part in (item.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "output_text"
+    ]
+    print("\n=== Agent final message ===\n" + "\n".join(texts))
