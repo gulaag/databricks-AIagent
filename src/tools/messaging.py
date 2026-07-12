@@ -14,6 +14,8 @@ import json
 import mlflow
 import requests
 
+from src.tools.guardrails import record_post, scan_for_secrets, seen_recently
+
 
 _SLACK_SECTION_LIMIT = 2900  # Slack mrkdwn section text limit is 3000; stay under it.
 
@@ -103,6 +105,23 @@ def post_to_channel(message: str, webhook_url: str) -> str:
     if not webhook_url:
         return "ERROR: No webhook URL configured; cannot post."
 
+    # Guardrail 1 — output leak prevention. Never let a credential-shaped string
+    # leave the perimeter, even if the LLM was somehow induced to include one.
+    leaked = scan_for_secrets(message)
+    if leaked:
+        return (
+            "ERROR: Refused to post — the message contains content matching "
+            f"sensitive credential patterns ({', '.join(leaked)}). Nothing was sent."
+        )
+
+    # Guardrail 2 — idempotency. Suppress an identical message re-sent within a
+    # short window (e.g. a re-run cell or a double invocation during a demo).
+    if seen_recently(message):
+        return (
+            "SUCCESS: Duplicate suppressed — an identical message was already "
+            "posted within the last 120 seconds; it was not sent again."
+        )
+
     is_slack = "hooks.slack.com" in webhook_url
     platform = "Slack" if is_slack else "Teams"
     payload = _slack_payload(message) if is_slack else _teams_payload(message)
@@ -116,6 +135,8 @@ def post_to_channel(message: str, webhook_url: str) -> str:
             timeout=10,
         )
         response.raise_for_status()
+        # Only record on a confirmed success so a failed post can be retried.
+        record_post(message)
         return f"SUCCESS: Message posted to {platform}. HTTP {response.status_code}."
 
     except requests.exceptions.Timeout:
