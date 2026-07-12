@@ -189,9 +189,13 @@ for _root, _dirs, _files in os.walk(SRC_DIR):
     for _fn in _files:
         if _fn.endswith(".py"):
             shutil.copyfile(os.path.join(_root, _fn), os.path.join(_dest, _fn))
-shutil.copyfile(os.path.join(REPO_ROOT, "agent_entry.py"), ENTRY_FILE)
+# agent_entry.py sits at the repo root, next to src/. Derive that root from the
+# imported package location rather than the hard-coded REPO_ROOT, so this works
+# regardless of the exact Git-folder name/casing on any given workspace.
+_repo_root = os.path.dirname(SRC_DIR)
+shutil.copyfile(os.path.join(_repo_root, "agent_entry.py"), ENTRY_FILE)
 print(f"Staged src -> {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
-print(f"Staged entry -> {ENTRY_FILE}")
+print(f"Staged entry -> {ENTRY_FILE} (from repo root {_repo_root})")
 
 # Declare the UC resources the agent depends on so Model Serving injects M2M OAuth.
 from mlflow.models.resources import (
