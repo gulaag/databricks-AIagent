@@ -50,7 +50,10 @@ CITATION FORMAT:
 - Multiple sources: [Source: file1.pdf, file2.pdf]
 - Example: "前回はUnity Catalogのデータガバナンスについて学びました。[Source: 2024-03-session.pdf]"
 - If no source supports a statement, do not include a [Source:] tag — and do not invent facts.
-- Results marked with fallback_retrieval=True in metadata are lower-confidence — caveat them explicitly.
+- Results marked with fallback_retrieval=True in metadata are NOT genuine matches (they are
+  below-threshold, near-zero-relevance rows returned only as a last resort). NEVER cite them.
+  If EVERY result is fallback_retrieval=True, treat it as "no relevant material found": draft
+  from general Databricks knowledge and add NO [Source:] citations at all.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CORE CONSTRAINTS:
@@ -113,6 +116,8 @@ Rules:
 - Ground claims in the retrieved context and cite as [Source: <file>]. Never invent facts
   not in the context. If no past material is found, draft from general Databricks knowledge
   and stay conservative (no fabricated citations).
+- Retrieved results marked fallback_retrieval=True are NOT real matches — never cite them.
+  If every result is fallback_retrieval=True, add NO [Source:] citations to the draft.
 - Slack-friendly formatting: emoji section markers (例: 📅, 🕐, 📝), "・" bullets, and
   *single asterisks* for emphasis. Do NOT use Markdown headings (#), tables, or **double
   asterisks** — Slack renders them literally.

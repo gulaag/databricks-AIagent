@@ -392,7 +392,13 @@ class TechEngineerAgent(ResponsesAgent):
             if isinstance(parsed, list):
                 for row in parsed:
                     if isinstance(row, dict):
-                        src = (row.get("metadata") or {}).get("source_file")
+                        meta = row.get("metadata") or {}
+                        # Fallback results are below-threshold, low/zero-relevance
+                        # matches — never cite them, or off-topic requests get a
+                        # spurious [Source:] tag.
+                        if meta.get("fallback_retrieval"):
+                            continue
+                        src = meta.get("source_file")
                         if src and src not in sources:
                             sources.append(src)
         return sources
@@ -424,7 +430,10 @@ class TechEngineerAgent(ResponsesAgent):
             if isinstance(parsed, list):
                 for row in parsed:
                     if isinstance(row, dict):
-                        src = (row.get("metadata") or {}).get("source_file")
+                        meta = row.get("metadata") or {}
+                        if meta.get("fallback_retrieval"):
+                            continue
+                        src = meta.get("source_file")
                         if src and src not in sources:
                             sources.append(src)
         return sources
