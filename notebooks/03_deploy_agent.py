@@ -91,11 +91,17 @@ from src.agent.responses_agent import TechEngineerResponsesAgent
 
 
 def _final_text(output_items: list) -> str:
-    """Concatenate the text of every assistant `message` item in the output."""
+    """Concatenate the text of every assistant `message` item in the output.
+
+    ResponsesAgentResponse.output holds typed OutputItem objects (not dicts), so
+    normalise each to a dict via model_dump() before reading it. Also handles the
+    plain-dict case (e.g. output parsed from a serving JSON response).
+    """
     texts: list[str] = []
     for item in output_items:
-        if item.get("type") == "message":
-            for part in item.get("content", []) or []:
+        d = item if isinstance(item, dict) else item.model_dump()
+        if d.get("type") == "message":
+            for part in d.get("content") or []:
                 if isinstance(part, dict) and part.get("type") == "output_text":
                     texts.append(part.get("text", ""))
     return "\n".join(texts)
