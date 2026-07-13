@@ -41,21 +41,61 @@ def _current_run_id(explicit: str | None) -> str | None:
     return active.info.run_id if active else None
 
 
+def _run_sql_to_completion(w, warehouse_id, statement, parameters=None, poll_timeout_s=120):
+    """Execute a statement and BLOCK until it reaches a terminal state.
+
+    Crucial for correctness: ``execute_statement`` with a ``wait_timeout`` returns
+    a non-terminal (PENDING/RUNNING) response when a cold warehouse is still
+    starting, and returns a FAILED response *without raising* on e.g. a permission
+    error. Reporting success on either is wrong — the row never lands. So we poll
+    to a terminal state and raise unless it actually SUCCEEDED, which lets the
+    caller surface a truthful FAILURE instead of a false SUCCESS.
+    """
+    import time as _time
+
+    resp = w.statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=statement,
+        parameters=parameters,
+        wait_timeout="30s",
+    )
+    deadline = _time.time() + poll_timeout_s
+    while resp.status and resp.status.state and resp.status.state.value in ("PENDING", "RUNNING"):
+        if _time.time() > deadline:
+            raise RuntimeError(
+                f"SQL statement did not finish within {poll_timeout_s}s "
+                f"(state={resp.status.state.value})"
+            )
+        _time.sleep(2)
+        resp = w.statement_execution.get_statement(resp.statement_id)
+
+    state = resp.status.state.value if (resp.status and resp.status.state) else "UNKNOWN"
+    if state != "SUCCEEDED":
+        detail = (
+            resp.status.error.message
+            if (resp.status and resp.status.error)
+            else f"terminal state {state}"
+        )
+        raise RuntimeError(f"SQL statement failed ({state}): {detail}")
+    return resp
+
+
 def _log_via_sql(table_name: str, warehouse_id: str, record: dict[str, Any]) -> str:
     """Append a record using the Databricks SQL Statement Execution API.
 
     Parameterised statements keep JSON payloads safe from SQL injection and
-    escaping issues. Works at serving time via injected M2M OAuth.
+    escaping issues. Works at serving time via injected M2M OAuth — provided the
+    serving endpoint's service principal has been granted MODIFY on the table.
+    Each statement is run to a verified terminal state, so a permission error or
+    a cold-warehouse timeout is surfaced as a real FAILURE, not a false success.
     """
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.sql import StatementParameterListItem
 
     w = WorkspaceClient()
 
-    w.statement_execution.execute_statement(
-        warehouse_id=warehouse_id,
-        statement=_TABLE_DDL_TEMPLATE.format(table=table_name),
-        wait_timeout="30s",
+    _run_sql_to_completion(
+        w, warehouse_id, _TABLE_DDL_TEMPLATE.format(table=table_name)
     )
 
     insert_sql = (
@@ -67,12 +107,7 @@ def _log_via_sql(table_name: str, warehouse_id: str, record: dict[str, Any]) -> 
         StatementParameterListItem(name=key, value=value)
         for key, value in record.items()
     ]
-    w.statement_execution.execute_statement(
-        warehouse_id=warehouse_id,
-        statement=insert_sql,
-        parameters=params,
-        wait_timeout="30s",
-    )
+    _run_sql_to_completion(w, warehouse_id, insert_sql, parameters=params)
     return f"SUCCESS: Action '{record['action_name']}' logged to {table_name} (SQL)."
 
 
