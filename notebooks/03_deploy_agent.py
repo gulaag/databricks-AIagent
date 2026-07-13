@@ -299,14 +299,18 @@ def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int =
         state = ep.state.config_update.value if ep.state else "UNKNOWN"
         ready = ep.state.ready.value if ep.state else "NOT_READY"
         print(f"  config_update={state} | ready={ready}")
-        if ready == "READY":
-            print(f"Endpoint {endpoint_name} is ready.")
-            return
         if state == "UPDATE_FAILED":
             raise RuntimeError(
                 f"Endpoint {endpoint_name} update FAILED. Check Serving > "
                 f"{endpoint_name} > build/service logs in the UI."
             )
+        # Wait for the config update to FINISH — not merely for the endpoint to be
+        # serving. During an update of an existing endpoint, `ready` stays READY
+        # (the OLD version keeps serving) the whole time the new version builds, so
+        # checking `ready` alone returns before the new version is actually live.
+        if ready == "READY" and state == "NOT_UPDATING":
+            print(f"Endpoint {endpoint_name} is ready (config update complete).")
+            return
         time.sleep(30)
     raise TimeoutError(f"Endpoint {endpoint_name} did not become ready within {timeout_s}s")
 
