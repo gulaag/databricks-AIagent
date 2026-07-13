@@ -54,6 +54,7 @@ from mlflow.types.responses import (
 
 from src.agent.prompts import (
     AUTONOMOUS_SYSTEM_PROMPT,
+    CHAT_SYSTEM_PROMPT,
     DRAFT_SYSTEM_PROMPT,
     SEARCH_TOOLS,
     TOOL_DEFINITIONS,
@@ -71,7 +72,7 @@ _LLM_BASE_BACKOFF_SECONDS = 1.5
 _LLM_MAX_BACKOFF_SECONDS = 15.0
 
 _DONE = "response.output_item.done"
-_VALID_MODES = {"auto", "draft", "send"}
+_VALID_MODES = {"auto", "draft", "send", "chat"}
 
 
 def _to_chat_messages(input_items: list[dict]) -> list[dict]:
@@ -150,9 +151,12 @@ class TechEngineerAgent(ResponsesAgent):
         self, request: ResponsesAgentRequest
     ) -> Generator[ResponsesAgentStreamEvent, None, None]:
         custom_inputs = request.custom_inputs or {}
-        mode = custom_inputs.get("mode", "auto") if isinstance(custom_inputs, dict) else "auto"
+        # Default is "chat": the conversational, draft-first, ask-before-posting flow
+        # the deployed endpoint / AI Playground should use. Notebook flows pass an
+        # explicit mode (auto / draft / send).
+        mode = custom_inputs.get("mode", "chat") if isinstance(custom_inputs, dict) else "chat"
         if mode not in _VALID_MODES:
-            mode = "auto"
+            mode = "chat"
         input_items = [item.model_dump() for item in request.input]
 
         if mode == "send":
@@ -169,6 +173,14 @@ class TechEngineerAgent(ResponsesAgent):
         if mode == "draft":
             system = DRAFT_SYSTEM_PROMPT + "\n\n" + UNTRUSTED_CONTENT_GUARD
             tools = SEARCH_TOOLS
+        elif mode == "chat":
+            system = CHAT_SYSTEM_PROMPT + "\n\n" + UNTRUSTED_CONTENT_GUARD
+            # First turn (no prior assistant reply) must NOT post: withhold the post
+            # tool so the agent can only search + draft + ask. Once a draft has been
+            # shown (a prior assistant message exists in the history), posting becomes
+            # available and the agent posts only on explicit approval (per the prompt).
+            has_prior_draft = any(it.get("role") == "assistant" for it in input_items)
+            tools = TOOL_DEFINITIONS if has_prior_draft else SEARCH_TOOLS
         else:  # auto
             system = AUTONOMOUS_SYSTEM_PROMPT + "\n\n" + UNTRUSTED_CONTENT_GUARD
             tools = TOOL_DEFINITIONS

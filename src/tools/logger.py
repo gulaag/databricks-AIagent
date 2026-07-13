@@ -21,17 +21,6 @@ from typing import Any
 
 import mlflow
 
-_TABLE_DDL_TEMPLATE = """
-CREATE TABLE IF NOT EXISTS {table} (
-  logged_at     STRING,
-  mlflow_run_id STRING,
-  action_name   STRING,
-  status        STRING,
-  input_json    STRING,
-  output_json   STRING
-) USING DELTA
-"""
-
 
 def _current_run_id(explicit: str | None) -> str | None:
     """Resolve the MLflow run id, preferring an explicit value."""
@@ -94,10 +83,10 @@ def _log_via_sql(table_name: str, warehouse_id: str, record: dict[str, Any]) -> 
 
     w = WorkspaceClient()
 
-    _run_sql_to_completion(
-        w, warehouse_id, _TABLE_DDL_TEMPLATE.format(table=table_name)
-    )
-
+    # Deliberately NO "CREATE TABLE IF NOT EXISTS" here. The audit table is
+    # provisioned once by the notebook / setup path; requiring CREATE TABLE would
+    # force a broad schema-level grant on the serving service principal. This path
+    # therefore needs only USE CATALOG + USE SCHEMA + MODIFY on the table.
     insert_sql = (
         f"INSERT INTO {table_name} "
         "(logged_at, mlflow_run_id, action_name, status, input_json, output_json) "
