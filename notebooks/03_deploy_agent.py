@@ -1,18 +1,15 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 03 — Register the ResponsesAgent to Unity Catalog & Deploy to Model Serving
+# MAGIC # 03 — Register the Agent to Unity Catalog & Deploy to Model Serving
 # MAGIC
-# MAGIC **Purpose:** Smoke-test the agent locally, log it to Unity Catalog via MLflow
-# MAGIC using the **`ResponsesAgent`** interface (the Databricks-recommended way to
-# MAGIC author agents), then deploy it to a Model Serving endpoint.
+# MAGIC **Purpose:** Smoke-test the unified agent locally, log it to Unity Catalog via
+# MAGIC MLflow using the **`ResponsesAgent`** interface (the Databricks-recommended way
+# MAGIC to author agents), then deploy it to a Model Serving endpoint.
 # MAGIC
-# MAGIC **Why `ResponsesAgent`?** It gives the deployed endpoint out-of-the-box
-# MAGIC compatibility with the AI Playground, Agent Evaluation, and Agent Monitoring,
-# MAGIC a standard streaming contract, and an automatically-inferred signature.
+# MAGIC One agent, three modes (selected per request via `custom_inputs={"mode": ...}`):
+# MAGIC `auto` (autonomous), `draft` (propose/refine, posts nothing), `send` (post approved).
 # MAGIC
 # MAGIC **Prerequisites:** Notebooks 01 and 02 must have been run successfully.
-# MAGIC **Cell order:** local smoke tests → log_model (models-from-code) → alias →
-# MAGIC deploy → wait → live test.
 
 # COMMAND ----------
 
@@ -30,9 +27,10 @@ import time
 import mlflow
 import mlflow.pyfunc
 
-# Repo root: used both to import src here AND to package src into the model so
-# the serving container can import it (otherwise: ModuleNotFoundError: 'src').
-REPO_ROOT = "/Workspace/Users/digvijay@arsaga.jp/databricks-AIagent"
+# Repo root is used only to import src here; Databricks also auto-adds it to the
+# path. The model packaging derives every path from the src import, so it is
+# independent of the exact Git-folder name.
+REPO_ROOT = "/Workspace/Users/digvijay@arsaga.jp/databricks-Aiagent"
 sys.path.insert(0, REPO_ROOT)
 
 # ---------------------------------------------------------------------------
@@ -49,9 +47,10 @@ VS_INDEX_NAME = "main.tech_engineer.sessions_vs_index"
 LOG_TABLE_NAME = "main.tech_engineer.agent_action_log"
 
 # SQL warehouse used for serving-time action logging (the serving container has
-# no Spark session). Set this to your warehouse ID, e.g. "abc123def456". Leave
-# empty to skip the SQL log path (the agent still runs; logging degrades gracefully).
-SQL_WAREHOUSE_ID = ""
+# no Spark session). Wiring it here makes the audit log work end-to-end from the
+# deployed endpoint, not just from notebooks. Serverless warehouse auto-starts on
+# demand and auto-stops when idle.
+SQL_WAREHOUSE_ID = "c222bab9769cec3a"
 
 # Resolve workspace host + token so the agent's LLM and Vector Search clients work
 # when the agent is run locally here (the smoke tests). At serving time these are
@@ -61,15 +60,14 @@ os.environ["DATABRICKS_TOKEN"] = (
     dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
 )
 
-# The agent reads its config from env vars (see TechEngineerResponsesAgent.__init__).
-# Set them for the local smoke test so retrieval + logging target the right places.
-# NOTE: WEBHOOK_URL is intentionally LEFT UNSET here so that nothing can be posted
-# to Slack during registration. The deployed endpoint receives the webhook from a
-# secret (Step 4); the live post happens only in Step 6.
+# The agent reads its config from env vars. For the local smoke test:
+#  - point retrieval + logging at the right places,
+#  - leave SQL_WAREHOUSE_ID empty so notebook logging uses the Spark path,
+#  - leave WEBHOOK_URL unset so NOTHING can be posted during registration.
 os.environ["DATABRICKS_FM_ENDPOINT"] = LLM_ENDPOINT
 os.environ["VS_INDEX_NAME"] = VS_INDEX_NAME
 os.environ["LOG_TABLE_NAME"] = LOG_TABLE_NAME
-os.environ["SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
+os.environ["SQL_WAREHOUSE_ID"] = ""
 os.environ.pop("WEBHOOK_URL", None)
 
 mlflow.set_registry_uri("databricks-uc")
@@ -79,73 +77,59 @@ mlflow.set_experiment(EXPERIMENT_PATH)
 
 # MAGIC %md ## Step 1 — Pre-registration smoke tests (must all pass before log_model)
 # MAGIC
-# MAGIC These exercise the `ResponsesAgent` locally with the Responses request shape
-# MAGIC (`{"input": [{"role": "user", "content": "..."}]}`). The queries are
-# MAGIC information / refusal cases — none ask the agent to post — so nothing is sent.
+# MAGIC Exercises the agent locally in `auto` mode (knowledge / retrieval / refusal —
+# MAGIC none of which post) and `draft` mode (propose, which never posts). Nothing is
+# MAGIC sent to Slack during registration.
 
 # COMMAND ----------
 
-from mlflow.types.responses import ResponsesAgentRequest
+from src.agent.agent import TechEngineerAgent
 
-from src.agent.responses_agent import TechEngineerResponsesAgent
+smoke_agent = TechEngineerAgent()
+failures = []
 
-
-def _final_text(output_items: list) -> str:
-    """Concatenate the text of every assistant `message` item in the output.
-
-    ResponsesAgentResponse.output holds typed OutputItem objects (not dicts), so
-    normalise each to a dict via model_dump() before reading it. Also handles the
-    plain-dict case (e.g. output parsed from a serving JSON response).
-    """
-    texts: list[str] = []
-    for item in output_items:
-        d = item if isinstance(item, dict) else item.model_dump()
-        if d.get("type") == "message":
-            for part in d.get("content") or []:
-                if isinstance(part, dict) and part.get("type") == "output_text":
-                    texts.append(part.get("text", ""))
-    return "\n".join(texts)
-
-
-SMOKE_TESTS = [
+# --- auto mode: information, retrieval, and out-of-scope refusal ---
+AUTO_TESTS = [
     {
         "query": "Databricks Unity Catalogについて教えてください。",
-        "expected_signals": ["Unity Catalog"],
-        "description": "Standard knowledge query",
+        "signals": ["Unity Catalog"],
+        "desc": "Standard knowledge query",
     },
     {
         "query": "過去のセッションでデータガバナンスについて話しましたか？",
-        # Pass if the answer either cites a source or gracefully reports no match.
-        "expected_signals": ["Source", "ガバナンス", "見つかりません"],
-        "description": "Retrieval answer is cited or gracefully empty",
+        "signals": ["Source", "ガバナンス", "見つかりません"],
+        "desc": "Retrieval answer is cited or gracefully empty",
     },
     {
         "query": "Pythonのクイックソートを実装してください。",
-        "expected_signals": ["対応できません"],
-        "description": "Out-of-scope refusal",
+        "signals": ["対応できません"],
+        "desc": "Out-of-scope refusal",
     },
 ]
 
-smoke_agent = TechEngineerResponsesAgent()
-
-failures = []
-for i, test in enumerate(SMOKE_TESTS):
+for i, test in enumerate(AUTO_TESTS):
     try:
-        request = ResponsesAgentRequest(
-            input=[{"role": "user", "content": test["query"]}]
-        )
-        response = smoke_agent.predict(request)
-        content = _final_text(response.output)
-        if not any(sig in content for sig in test["expected_signals"]):
+        content = smoke_agent.autonomous(test["query"])
+        if not any(sig in content for sig in test["signals"]):
             failures.append(
-                f"Test {i + 1} ({test['description']}): "
-                f"Expected one of {test['expected_signals']} in response.\n"
-                f"Got: {content[:300]}"
+                f"[auto] Test {i + 1} ({test['desc']}): expected one of "
+                f"{test['signals']}.\nGot: {content[:300]}"
             )
         else:
-            print(f"PASS — Test {i + 1}: {test['description']}")
+            print(f"PASS — [auto] {test['desc']}")
     except Exception as exc:
-        failures.append(f"Test {i + 1} ({test['description']}): Exception: {exc}")
+        failures.append(f"[auto] Test {i + 1} ({test['desc']}): Exception: {exc}")
+
+# --- draft mode: propose a complete announcement (posts nothing) ---
+try:
+    result = smoke_agent.propose(
+        "来週のTech Engineer共有会で「Databricks AI Agent入門」を1時間でやりたい。"
+    )
+    draft = result.get("draft") or ""
+    assert len(draft) > 50, f"draft unexpectedly short: {draft!r}"
+    print(f"PASS — [draft] proposed {len(draft)} chars; sources={result.get('sources')}")
+except Exception as exc:
+    failures.append(f"[draft] propose: Exception: {exc}")
 
 assert not failures, "Pre-registration smoke tests failed:\n" + "\n\n".join(failures)
 print("\nAll smoke tests passed. Proceeding with model registration.")
@@ -154,15 +138,13 @@ print("\nAll smoke tests passed. Proceeding with model registration.")
 
 # MAGIC %md ## Step 2 — Log the agent to Unity Catalog (models-from-code)
 # MAGIC
-# MAGIC `ResponsesAgent` models are logged via the *models-from-code* pattern: we
-# MAGIC point `python_model` at `agent_entry.py` (which calls `mlflow.models.set_model`)
-# MAGIC and ship the `src` package via `code_paths`. MLflow infers the signature from
-# MAGIC the `ResponsesAgent` schema automatically — we do not pass one.
+# MAGIC `ResponsesAgent` models are logged via the *models-from-code* pattern: we point
+# MAGIC `python_model` at `agent_entry.py` (which calls `mlflow.models.set_model`) and
+# MAGIC ship the `src` package via `code_paths`. MLflow infers the signature from the
+# MAGIC `ResponsesAgent` schema automatically — we do not pass one.
 
 # COMMAND ----------
 
-# Serving container needs no Spark: the LLM call goes through mlflow.deployments,
-# Vector Search and SQL logging through databricks-sdk. All auth via M2M OAuth.
 pip_requirements = [
     "mlflow>=3.1",
     "requests",
@@ -170,11 +152,10 @@ pip_requirements = [
     "databricks-sdk",
 ]
 
-# Stage src to local disk for code_paths. MLflow refuses to copy from a /Workspace
-# Repo path (it may contain notebook objects), and the repo's real on-disk path can
-# differ from any hard-coded guess. So derive src's actual location from the import,
-# then copy only .py files into a clean local dir. Stage agent_entry.py alongside
-# it (NOT inside src) and use that file as the models-from-code entry point.
+# Stage src to local disk for code_paths (MLflow refuses to copy from a /Workspace
+# Repo path). Derive src's real location from the import, copy only .py files, and
+# stage agent_entry.py next to it (from the same repo root the import resolves to,
+# so this is independent of the Git-folder name).
 import src as _src_pkg
 
 SRC_DIR = (
@@ -195,9 +176,7 @@ for _root, _dirs, _files in os.walk(SRC_DIR):
     for _fn in _files:
         if _fn.endswith(".py"):
             shutil.copyfile(os.path.join(_root, _fn), os.path.join(_dest, _fn))
-# agent_entry.py sits at the repo root, next to src/. Derive that root from the
-# imported package location rather than the hard-coded REPO_ROOT, so this works
-# regardless of the exact Git-folder name/casing on any given workspace.
+
 _repo_root = os.path.dirname(SRC_DIR)
 shutil.copyfile(os.path.join(_repo_root, "agent_entry.py"), ENTRY_FILE)
 print(f"Staged src -> {LOCAL_SRC}: {sorted(os.listdir(LOCAL_SRC))}")
@@ -217,7 +196,7 @@ resources = [
 if SQL_WAREHOUSE_ID:
     resources.append(DatabricksSQLWarehouse(warehouse_id=SQL_WAREHOUSE_ID))
 
-# A non-posting example request used for signature/example purposes.
+# A non-posting example request (Responses format) for the input example.
 input_example = {
     "input": [
         {"role": "user", "content": "Databricks AI Agentとは何かを一言で教えてください。"}
@@ -247,8 +226,6 @@ with mlflow.start_run(run_name="agent-registration") as run:
 
 from mlflow.tracking import MlflowClient
 
-# Use the version returned by log_model rather than latest_versions[0], which is
-# deprecated under Unity Catalog and not reliably ordered.
 client = MlflowClient(registry_uri="databricks-uc")
 latest_version = model_info.registered_model_version
 
@@ -263,8 +240,9 @@ print(f"Set alias 'champion' -> version {latest_version} of {MODEL_NAME}")
 
 # MAGIC %md ## Step 4 — Create or update the Model Serving endpoint
 # MAGIC
-# MAGIC The agent reads its config from env vars. `WEBHOOK_URL` comes from a secret
-# MAGIC so the webhook is never baked into the artifact or printed in logs.
+# MAGIC The agent reads config from env vars. `WEBHOOK_URL` comes from a secret so it is
+# MAGIC never baked into the artifact or printed. `SQL_WAREHOUSE_ID` makes the audit log
+# MAGIC work from the serving container (which has no Spark).
 
 # COMMAND ----------
 
@@ -283,7 +261,6 @@ env_vars = {
     "VS_INDEX_NAME": VS_INDEX_NAME,
     "LOG_TABLE_NAME": LOG_TABLE_NAME,
 }
-# Only include SQL_WAREHOUSE_ID when set — an empty env-var value can be rejected.
 if SQL_WAREHOUSE_ID:
     env_vars["SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID
 
@@ -304,10 +281,7 @@ if SERVING_ENDPOINT_NAME in existing:
     )
     print(f"Updated endpoint: {SERVING_ENDPOINT_NAME}")
 else:
-    w.serving_endpoints.create(
-        name=SERVING_ENDPOINT_NAME,
-        config=endpoint_config,
-    )
+    w.serving_endpoints.create(name=SERVING_ENDPOINT_NAME, config=endpoint_config)
     print(f"Created endpoint: {SERVING_ENDPOINT_NAME}")
 
 # COMMAND ----------
@@ -318,12 +292,7 @@ else:
 
 
 def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int = 2400) -> None:
-    """Poll until the endpoint reports ready=READY, or fail fast on UPDATE_FAILED.
-
-    First-time serving builds (container + deps + compute) can take 10-30 min,
-    hence the long timeout. A failed update is surfaced immediately instead of
-    waiting out the clock.
-    """
+    """Poll until the endpoint reports ready=READY, or fail fast on UPDATE_FAILED."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         ep = wc.serving_endpoints.get(name=endpoint_name)
@@ -339,9 +308,7 @@ def _wait_for_endpoint(wc: WorkspaceClient, endpoint_name: str, timeout_s: int =
                 f"{endpoint_name} > build/service logs in the UI."
             )
         time.sleep(30)
-    raise TimeoutError(
-        f"Endpoint {endpoint_name} did not become ready within {timeout_s}s"
-    )
+    raise TimeoutError(f"Endpoint {endpoint_name} did not become ready within {timeout_s}s")
 
 
 _wait_for_endpoint(w, SERVING_ENDPOINT_NAME)
@@ -353,9 +320,8 @@ _wait_for_endpoint(w, SERVING_ENDPOINT_NAME)
 # MAGIC `ResponsesAgent` endpoints accept the Responses request shape directly
 # MAGIC (`{"input": [...]}`) and return `{"output": [...]}`.
 # MAGIC
-# MAGIC **NOTE:** the deployed agent is AUTONOMOUS — this request asks it to post, so
-# MAGIC it **will** post to the Slack test channel. The human-approval demo lives in
-# MAGIC notebooks 04 / 05.
+# MAGIC **NOTE:** this asks the agent to post, so it **will** post to the Slack test
+# MAGIC channel (default `auto` mode) and write an audit-log row via the SQL warehouse.
 
 # COMMAND ----------
 
