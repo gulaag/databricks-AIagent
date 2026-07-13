@@ -59,6 +59,20 @@ mlflow.set_experiment("/Users/digvijay@arsaga.jp/agent-demo")
 agent = TechEngineerAgent()
 print("Agent ready.")
 
+
+def show_audit_log(n: int = 10):
+    """Freshly query and display the most recent audit-log rows.
+
+    Called right after send / autonomous so the updated trail appears inline —
+    no need to re-run a separate cell during the demo.
+    """
+    display(
+        spark.sql(
+            f"SELECT logged_at, action_name, status FROM {LOG_TABLE_NAME} "
+            f"ORDER BY logged_at DESC LIMIT {n}"
+        )
+    )
+
 # COMMAND ----------
 
 # MAGIC %md # Demo 1 — Conversational (propose → refine → approve → send)
@@ -121,6 +135,10 @@ if dbutils.widgets.get("confirm_send") == "yes":
     res = agent.send()
     print(res["post_status"])
     print(res["log_status"])
+    # Auto-display the refreshed audit trail — the just-logged action appears here
+    # immediately, so there is nothing to re-run during the demo.
+    print("\n=== 実行ログ（最新・自動更新） ===")
+    show_audit_log()
 else:
     print("Not sent. Review/refine above, set 'Confirm: send to Slack?' = yes, then re-run.")
 
@@ -146,18 +164,17 @@ if dbutils.widgets.get("confirm_autonomous") == "yes":
     final = agent.autonomous(dbutils.widgets.get("auto_request"))
     print("=== Autonomous run complete — final message ===\n")
     print(final)
+    print("\n=== 実行ログ（最新・自動更新） ===")
+    show_audit_log()
 else:
     print("Skipped. Set 'Run autonomous (will post)?' = yes to run the hands-off mode.")
 
 # COMMAND ----------
 
 # MAGIC %md # Execution log (the audit trail)
+# MAGIC This same view is shown automatically right after `send` / `autonomous` above —
+# MAGIC re-run this cell only if you want to refresh it independently.
 
 # COMMAND ----------
 
-display(
-    spark.sql(
-        f"SELECT logged_at, action_name, status FROM {LOG_TABLE_NAME} "
-        "ORDER BY logged_at DESC LIMIT 10"
-    )
-)
+show_audit_log()
