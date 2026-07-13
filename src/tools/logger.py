@@ -112,11 +112,19 @@ def _log_via_sql(table_name: str, warehouse_id: str, record: dict[str, Any]) -> 
 
 
 def _log_via_spark(table_name: str, record: dict[str, Any]) -> str:
-    """Append a record using Spark (notebook / cluster fallback)."""
-    from pyspark.sql import Row, SparkSession
+    """Append a record using Spark (notebook / cluster fallback).
+
+    Uses an explicit all-STRING (nullable) schema instead of inferring it from a
+    single row. Inference raises CANNOT_DETERMINE_TYPE when any value is None
+    (e.g. mlflow_run_id with no active run), which was silently dropping every
+    notebook log write. All audit columns are strings, so this is exact.
+    """
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import StringType, StructField, StructType
 
     spark = SparkSession.builder.getOrCreate()
-    df = spark.createDataFrame([Row(**record)])
+    schema = StructType([StructField(name, StringType(), True) for name in record])
+    df = spark.createDataFrame([tuple(record.values())], schema=schema)
     df.write.format("delta").mode("append").saveAsTable(table_name)
     return f"SUCCESS: Action '{record['action_name']}' logged to {table_name} (Spark)."
 
