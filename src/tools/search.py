@@ -103,7 +103,18 @@ def search_knowledge_base(
             raw = index.similarity_search(**fallback_kwargs)
             results = _parse_vs_results(raw, col_names)
             for r in results:
-                r["metadata"]["fallback_retrieval"] = True
+                r.setdefault("metadata", {})["fallback_retrieval"] = True
+
+        # Some VS responses return rows with score 0.0 even when a threshold was set.
+        # Flag those so the agent never cites them as genuine matches.
+        if similarity_threshold > 0.0:
+            for r in results:
+                try:
+                    score = float(r.get("score") or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if score < similarity_threshold:
+                    r.setdefault("metadata", {})["fallback_retrieval"] = True
 
         return results
 
